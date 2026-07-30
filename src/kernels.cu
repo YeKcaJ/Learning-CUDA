@@ -3,6 +3,37 @@
 
 #include "../tester/utils.h"
 
+// 显存池：算子按 host 接口逐次调用，每次都 cudaMalloc/cudaFree 的开销
+// 远超 kernel 本身。这里跨调用复用一整块显存，按需增长、不归还。
+// 单线程使用（测试框架串行调用），未加锁。
+namespace {
+
+class DeviceArena {
+ public:
+  // 保证每段起始地址 256B 对齐，满足任意类型的向量化访存要求
+  static size_t align(size_t bytes) { return (bytes + 255) & ~static_cast<size_t>(255); }
+
+  // 容量不足时整块重分配；旧数据无需保留，故直接 free 再 malloc
+  void reserve(size_t bytes) {
+    if (bytes <= capacity_) return;
+    if (base_) RUNTIME_CHECK(cudaFree(base_));
+    RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&base_), bytes));
+    capacity_ = bytes;
+  }
+
+  char* at(size_t offset) const { return base_ + offset; }
+
+ private:
+  char* base_ = nullptr;
+  size_t capacity_ = 0;
+  // 析构时刻意不 cudaFree：静态对象销毁可能晚于 CUDA runtime 卸载，
+  // 此时调用会报错。进程退出由驱动统一回收。
+};
+
+DeviceArena g_arena;  // float / half 两份实例化共用同一块
+
+}  // namespace
+
 // *********************************************************************
 // 题目一：RMSNorm
 // *********************************************************************
@@ -45,7 +76,9 @@ __device__ __forceinline__ float blockReduceSum(float v, float* smem)
 }
 
 // RMSNorm kernel
-template <typename T, int BLOCK>
+// USE_SMEM=true 时第一趟顺手把整行缓存进 shared memory，第二趟不再访问 global；
+// 整行装不下 shared memory 时置 false 回退为重读
+template <typename T, int BLOCK, bool USE_SMEM>
 __global__ void rmsNormKernel(const T* __restrict__ input,const T* __restrict__ weight,T* __restrict__ output, size_t hidden_dim,float eps)
 {
 
@@ -55,12 +88,16 @@ __global__ void rmsNormKernel(const T* __restrict__ input,const T* __restrict__ 
 
   __shared__ float s_partial[BLOCK / kWarpSize];
   __shared__ float s_scale;
+  // 动态分配，长度 hidden_dim；排在静态 smem 之后，不会与上面两个重叠
+  extern __shared__ float s_row[];
 
   // 第一趟求平方和，步长循环天然覆盖 hidden_dim 非 BLOCK 整数倍的情况
   float local_sum = 0.0f;
-  for (size_t j = threadIdx.x; j < hidden_dim; j += BLOCK) 
+  for (size_t j = threadIdx.x; j < hidden_dim; j += BLOCK)
   {
     const float x = loadAsFloat(in_row[j]);
+    // 缓存已转好的 fp32 值，第二趟省一次 global 读 + 一次类型转换
+    if (USE_SMEM) s_row[j] = x;
     local_sum += x * x;
   }
 
@@ -71,16 +108,15 @@ __global__ void rmsNormKernel(const T* __restrict__ input,const T* __restrict__ 
   {
     const float mean_square = row_sum / static_cast<float>(hidden_dim);
     s_scale = rsqrtf(mean_square + eps);
-  }
-  __syncthreads();
+
 
   const float scale = s_scale;
 
-  // 第二趟缩放写出
-  for (size_t j = threadIdx.x; j < hidden_dim; j += BLOCK) 
+  // 第二趟缩放写出。weight 与行无关、天然驻留 L2，不必缓存
+  for (size_t j = threadIdx.x; j < hidden_dim; j += BLOCK)
   {
-    const float v = loadAsFloat(in_row[j]) * scale * loadAsFloat(weight[j]);
-    storeFromFloat(v, out_row[j]);
+    const float x = USE_SMEM ? s_row[j] : loadAsFloat(in_row[j]);
+    storeFromFloat(x * scale * loadAsFloat(weight[j]), out_row[j]);
   }
 }
 
@@ -113,38 +149,54 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
   if (h_input.size() < total || h_weight.size() < hidden_dim) return;
   if (h_output.size() < total) h_output.resize(total);
 
-  T *d_input = nullptr, *d_weight = nullptr, *d_output = nullptr;
-  RUNTIME_CHECK(cudaMalloc(&d_input, total * sizeof(T)));
-  RUNTIME_CHECK(cudaMalloc(&d_weight, hidden_dim * sizeof(T)));
-  RUNTIME_CHECK(cudaMalloc(&d_output, total * sizeof(T)));
+  // 三段布局在同一块显存里：input | weight | output
+  const size_t off_input = 0;
+  const size_t off_weight = DeviceArena::align(total * sizeof(T));
+  const size_t off_output = off_weight + DeviceArena::align(hidden_dim * sizeof(T));
+  g_arena.reserve(off_output + DeviceArena::align(total * sizeof(T)));
+
+  T* d_input = reinterpret_cast<T*>(g_arena.at(off_input));
+  T* d_weight = reinterpret_cast<T*>(g_arena.at(off_weight));
+  T* d_output = reinterpret_cast<T*>(g_arena.at(off_output));
 
   RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(), total * sizeof(T),cudaMemcpyHostToDevice));
 
   RUNTIME_CHECK(cudaMemcpy(d_weight, h_weight.data(), hidden_dim * sizeof(T),cudaMemcpyHostToDevice));
 
+  // 整行缓存需 hidden_dim 个 float；留 1KB 给静态 smem 与编译器余量
+  int max_smem = 0;
+  int device = 0;
+  RUNTIME_CHECK(cudaGetDevice(&device));
+  RUNTIME_CHECK(cudaDeviceGetAttribute(
+      &max_smem, cudaDevAttrMaxSharedMemoryPerBlock, device));
+  const size_t smem_bytes = hidden_dim * sizeof(float);
+  const bool use_smem = smem_bytes + 1024 <= static_cast<size_t>(max_smem);
+
   // block 大小按 hidden_dim 分档，模板参数保证归约循环编译期展开
   const unsigned int grid = static_cast<unsigned int>(rows);
-  if (hidden_dim <= 128) 
+  if (hidden_dim <= 128)
   {
-    rmsNormKernel<T, 128><<<grid, 128>>>(d_input, d_weight, d_output,hidden_dim, eps);
-  } 
-  else if (hidden_dim <= 1024) 
+    // 该档 smem 至多 512B，恒定装得下，不必生成回退版本
+    rmsNormKernel<T, 128, true><<<grid, 128, smem_bytes>>>(d_input, d_weight, d_output,hidden_dim, eps);
+  }
+  else if (hidden_dim <= 1024)
   {
-    rmsNormKernel<T, 256><<<grid, 256>>>(d_input, d_weight, d_output,hidden_dim, eps);
-  } 
+    rmsNormKernel<T, 256, true><<<grid, 256, smem_bytes>>>(d_input, d_weight, d_output,hidden_dim, eps);
+  }
+  else if (use_smem)
+  {
+    rmsNormKernel<T, 512, true><<<grid, 512, smem_bytes>>>(d_input, d_weight, d_output,hidden_dim, eps);
+  }
   else
   {
-    rmsNormKernel<T, 512><<<grid, 512>>>(d_input, d_weight, d_output,hidden_dim, eps);
+    // 超大 hidden_dim：装不进 smem，退回第二趟重读 global
+    rmsNormKernel<T, 512, false><<<grid, 512>>>(d_input, d_weight, d_output,hidden_dim, eps);
   }
 
   RUNTIME_CHECK(cudaGetLastError());
 
   // 默认流上 cudaMemcpy 阻塞并隐式等 kernel，无需额外同步
   RUNTIME_CHECK(cudaMemcpy(h_output.data(), d_output, total * sizeof(T),cudaMemcpyDeviceToHost));
-
-  RUNTIME_CHECK(cudaFree(d_input));
-  RUNTIME_CHECK(cudaFree(d_weight));
-  RUNTIME_CHECK(cudaFree(d_output));
 }
 
 
