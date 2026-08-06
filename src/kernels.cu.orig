@@ -451,18 +451,99 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
         O_tile[ty * head_dim + d] = 0.0f;
       }
 
-    float m_i = -INFINITY; //本行当前的最大 score
-    float l_i = 0.0f;      //本行当前的 exp 和
+    float m_i = -INFINITY; //本行全局最大 score
     __syncthreads();
 
-//4.主循环：遍历所有K/V分块
+//4.第一遍：只遍历 K，求整行固定的 softmax 最大值
     const int num_kv_blocks = (src_seq_len + BN - 1) / BN;
 
     for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++)
     {
       const int kv_start = kv_block * BN;
 
-      //加载K/V_tile：BM 个 warp 分摊 BN 行，ty 跨步覆盖（BM 可能小于 BN）
+      for (int r = ty; r < BN; r += BM)
+        {
+          const int kv_row = kv_start + r;
+          const bool kv_valid = kv_row < src_seq_len;
+          for (int d = lane; d < head_dim; d += BN)
+            {
+              K_tile[r * head_dim + d] =
+                  kv_valid ? loadAsFloat(k_base[(size_t)kv_row * kv_stride + d]) : 0.0f;
+            }
+        }
+      __syncthreads();
+
+      const int kv_pos = kv_start + lane;
+      float s = -INFINITY;
+      if (kv_pos < src_seq_len && !(is_causal && kv_pos > q_row))
+        {
+          float dot = 0.0f;
+          for (int d = 0; d < head_dim; d++)
+            {
+              dot += Q_tile[ty * head_dim + d] * K_tile[lane * head_dim + d];
+            }
+          s = dot * scale;
+        }
+
+      m_i = fmaxf(m_i, warpAllReduceMax(s));
+
+      //下一轮会覆盖 K_tile，须等本块所有 warp 用完
+      __syncthreads();
+    }
+
+//5.第二遍：使用固定 m_i，按原始 key 顺序累计 softmax 分母
+    float l_i = 0.0f; //只有 lane 0 更新，结束后再广播
+
+    for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++)
+    {
+      const int kv_start = kv_block * BN;
+
+      for (int r = ty; r < BN; r += BM)
+        {
+          const int kv_row = kv_start + r;
+          const bool kv_valid = kv_row < src_seq_len;
+          for (int d = lane; d < head_dim; d += BN)
+            {
+              K_tile[r * head_dim + d] =
+                  kv_valid ? loadAsFloat(k_base[(size_t)kv_row * kv_stride + d]) : 0.0f;
+            }
+        }
+      __syncthreads();
+
+      const int kv_pos = kv_start + lane;
+      float s = -INFINITY;
+      if (kv_pos < src_seq_len && !(is_causal && kv_pos > q_row))
+        {
+          float dot = 0.0f;
+          for (int d = 0; d < head_dim; d++)
+            {
+              dot += Q_tile[ty * head_dim + d] * K_tile[lane * head_dim + d];
+            }
+          s = dot * scale;
+        }
+
+      //所有 lane 依次把 score 送给 lane 0。直接写成 l += expf(...)，使编译器
+      //能像参考 kernel 一样把 expf 的最后一步与加法融合，避免 p 落盘后的额外舍入。
+      for (int k = 0; k < BN; k++)
+        {
+          const float s_k = __shfl_sync(0xffffffffu, s, k);
+          if (lane == 0 && s_k > -INFINITY)
+            {
+              l_i += expf(s_k - m_i);
+            }
+        }
+
+      __syncthreads();
+    }
+
+    l_i = __shfl_sync(0xffffffffu, l_i, 0);
+    const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+
+//6.第三遍：先归一化每个概率，再按 key 顺序累计 p * V
+    for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++)
+    {
+      const int kv_start = kv_block * BN;
+
       for (int r = ty; r < BN; r += BM)
         {
           const int kv_row = kv_start + r;
@@ -476,8 +557,7 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
             }
         }
       __syncthreads();
-        
-      //每个 lane 算一个 score：lane l 负责 k = kv_start + l
+
       const int kv_pos = kv_start + lane;
       float s = -INFINITY;
       if (kv_pos < src_seq_len && !(is_causal && kv_pos > q_row))
@@ -490,49 +570,36 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
           s = dot * scale;
         }
 
-      //在线softmax：先求本块行内最大值，与历史 m_i 合并
-      const float m_new = fmaxf(m_i, warpAllReduceMax(s));
+      const float p = (s > -INFINITY) ? inv_l * expf(s - m_i) : 0.0f;
+      P_tile[ty * BN + lane] = p;
+      __syncwarp();
 
-      //整行都被 mask 掉时 m_new 仍是 -inf，此时本块无贡献，跳过以免出 NaN
-      if (m_new > -INFINITY)
+      for (int d = lane; d < head_dim; d += BN)
         {
-          const float p = (s > -INFINITY) ? expf(s - m_new) : 0.0f;
-          //m_i 为 -inf（首个有效块）时 rescale 记为 0，等价于从零开始累加
-          const float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f;
-
-          l_i = l_i * rescale + warpAllReduceSum(p);
-          m_i = m_new;
-
-          P_tile[ty * BN + lane] = p;
-          __syncwarp(); //本行的 P 由本 warp 写、本 warp 读，warp 级同步即可
-
-          //O 累加：lane 负责 head_dim 的一段，各自遍历本块全部 BN 个 k
-          for (int d = lane; d < head_dim; d += BN)
+          float acc = O_tile[ty * head_dim + d];
+          for (int k = 0; k < BN; k++)
             {
-              float acc = O_tile[ty * head_dim + d] * rescale;
-              for (int k = 0; k < BN; k++)
+              const float p_k = P_tile[ty * BN + k];
+              if (p_k != 0.0f)
                 {
-                  const float p_k = P_tile[ty * BN + k];
-                  if (p_k != 0.0f) acc += p_k * V_tile[k * head_dim + d];
+                  acc = fmaf(p_k, V_tile[k * head_dim + d], acc);
                 }
-              O_tile[ty * head_dim + d] = acc;
             }
+          O_tile[ty * head_dim + d] = acc;
         }
-      //下一轮要覆盖 K/V_tile，须等本块所有 warp 用完
+
       __syncthreads();
     }
 
-//5.写回输出
+//7.写回输出
     if (!q_valid) return;
 
-    //l_i 为 0 说明该行全被 mask（causal 下 q 在所有 k 之前），按 0 输出
-    const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
     T* o_row = d_o + (size_t)batch_id * target_seq_len * q_stride
                    + (size_t)q_row * q_stride
                    + (size_t)query_head_id * head_dim;
     for (int d = lane; d < head_dim; d += BN)
       {
-        storeFromFloat(O_tile[ty * head_dim + d] * inv_l, o_row[d]);
+        storeFromFloat(O_tile[ty * head_dim + d], o_row[d]);
       }
 }
 
