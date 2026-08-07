@@ -390,6 +390,12 @@ void rmsNorm(const std::vector<T>& h_input,
 //lane 号即 K 的列号」的映射靠这个前提，行内规约才能全走 shuffle，不落 smem。
 static constexpr int kFaTileN = kWarpSize;
 
+//K_tile 行距的额外 padding。点积内层按 K_tile[lane * stride + d] 取数，warp 内 d 相同、
+//lane 走 0..31，若 stride 是 32 的倍数（head_dim=32/64）则 32 个 lane 全撞同一个 bank，
+//被拆成 32 次串行事务。行距 +1 后 bank 号变成 (lane + d) % 32，刚好一人一个。
+//V_tile 不需要：它按 [k * head_dim + d] 取，d = lane 本就连续。
+static constexpr int kFaSmemPad = 1;
+
 //K/V 分块加载：BM 个 warp 分摊 BN 行，ty 跨步覆盖（BM 可能小于 BN）。
 //row_limit 是整个序列的长度，不是某一行的 causal 上界：tile 由全 block 共用。
 //越界行填 0，配合 p=0 使 fmaf 贡献恰好为 0。
@@ -397,7 +403,7 @@ template <typename T, int BM, int BN>
 __device__ __forceinline__ void loadKTile(float* K_tile, const T* k_base,
                                           int kv_start, int row_limit,
                                           int kv_stride, int head_dim,
-                                          int ty, int lane)
+                                          int k_smem_stride, int ty, int lane)
 {
     for (int r = ty; r < BN; r += BM)
       {
@@ -405,7 +411,7 @@ __device__ __forceinline__ void loadKTile(float* K_tile, const T* k_base,
         const bool ok = kv_row < row_limit;
         for (int d = lane; d < head_dim; d += BN)
           {
-            K_tile[r * head_dim + d] =
+            K_tile[r * k_smem_stride + d] =
                 ok ? loadAsFloat(k_base[(size_t)kv_row * kv_stride + d]) : 0.0f;
           }
       }
@@ -416,7 +422,7 @@ __device__ __forceinline__ void loadKVTile(float* K_tile, float* V_tile,
                                            const T* k_base, const T* v_base,
                                            int kv_start, int row_limit,
                                            int kv_stride, int head_dim,
-                                           int ty, int lane)
+                                           int k_smem_stride, int ty, int lane)
 {
     for (int r = ty; r < BN; r += BM)
       {
@@ -425,8 +431,8 @@ __device__ __forceinline__ void loadKVTile(float* K_tile, float* V_tile,
         for (int d = lane; d < head_dim; d += BN)
           {
             const size_t off = (size_t)kv_row * kv_stride + d;
-            K_tile[r * head_dim + d] = ok ? loadAsFloat(k_base[off]) : 0.0f;
-            V_tile[r * head_dim + d] = ok ? loadAsFloat(v_base[off]) : 0.0f;
+            K_tile[r * k_smem_stride + d] = ok ? loadAsFloat(k_base[off]) : 0.0f;
+            V_tile[r * head_dim + d]      = ok ? loadAsFloat(v_base[off]) : 0.0f;
           }
       }
 }
@@ -449,9 +455,11 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
 //1.共享内存分区：全部按 head_dim 动态定尺
     //统一存 fp32：half 输入在加载时转换一次，后续算术无需反复转型
     extern __shared__ char smem_raw[];
+    //只有 K 的行距带 padding，用来消掉点积内层的 bank conflict（见 kFaSmemPad）
+    const int k_smem_stride = head_dim + kFaSmemPad;
     float* Q_tile = reinterpret_cast<float*>(smem_raw); //[BM][head_dim]
-    float* K_tile = Q_tile + BM * head_dim;             //[BN][head_dim]
-    float* V_tile = K_tile + BN * head_dim;             //[BN][head_dim]
+    float* K_tile = Q_tile + BM * head_dim;             //[BN][head_dim + pad]
+    float* V_tile = K_tile + BN * k_smem_stride;        //[BN][head_dim]
     float* O_tile = V_tile + BN * head_dim;             //[BM][head_dim] fp32 累加器
     float* P_tile = O_tile + BM * head_dim;             //[BM][BN] 本块概率
 
@@ -488,7 +496,13 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
     const int key_end = is_causal ? min(src_seq_len, q_row + 1) : src_seq_len;
     //循环上界必须与 q_row 无关：块内各 warp 的 key_end 不同，若据此定次数，
     //循环体里的 __syncthreads() 就会分叉，K_tile 会被提前退出的 warp 覆写。
-    const int num_kv_blocks = (src_seq_len + BN - 1) / BN;
+    //但可以取「块内最大的 key_end」——它只依赖 blockIdx.x，对全 block 一致，
+    //于是 causal 下靠后的 K 块整块无效，可以直接不进循环。
+    //#14 (Tq=512, Tk=2048, BM=32) 因此从 16×64 次迭代降到 1+2+…+16 = 136 次。
+    const int block_last_row = min(target_seq_len, (int)(blockIdx.x + 1) * BM) - 1;
+    const int block_key_end =
+        is_causal ? min(src_seq_len, block_last_row + 1) : src_seq_len;
+    const int num_kv_blocks = (block_key_end + BN - 1) / BN;
     __syncthreads();
 
     //scale 在 device 端算：sqrt.rn + rcp.rn
@@ -500,7 +514,8 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
       float dot = 0.0f;
       for (int d = 0; d < head_dim; d++)
         {
-          dot = fmaf(Q_tile[ty * head_dim + d], K_tile[lane * head_dim + d], dot);
+          dot = fmaf(Q_tile[ty * head_dim + d],
+                     K_tile[lane * k_smem_stride + d], dot);
         }
       return dot;
     };
@@ -510,9 +525,10 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
     for (int kb = 0; kb < num_kv_blocks; kb++)
       {
         const int kv_start = kb * BN;
-        //加载上界用 src_seq_len：tile 是块内共享的，不能按本 warp 的 key_end 截断
-        loadKTile<T, BM, BN>(K_tile, k_base, kv_start, src_seq_len, kv_stride,
-                             head_dim, ty, lane);
+        //加载上界用块级的 block_key_end，不能用本 warp 的 key_end：tile 是块内共享的。
+        //越界行填 0 即可——凡是 valid 的 lane 都满足 kv_pos < key_end <= block_key_end。
+        loadKTile<T, BM, BN>(K_tile, k_base, kv_start, block_key_end, kv_stride,
+                             head_dim, k_smem_stride, ty, lane);
         __syncthreads();
         //m 取的是已舍入的 dot*scale，这一步不能融合（后面是 max，不是加法）
         const bool valid = (kv_start + lane) < key_end;
@@ -526,8 +542,8 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
     for (int kb = 0; kb < num_kv_blocks; kb++)
       {
         const int kv_start = kb * BN;
-        loadKTile<T, BM, BN>(K_tile, k_base, kv_start, src_seq_len, kv_stride,
-                             head_dim, ty, lane);
+        loadKTile<T, BM, BN>(K_tile, k_base, kv_start, block_key_end, kv_stride,
+                             head_dim, k_smem_stride, ty, lane);
         __syncthreads();
         //exp 的参数必须是一条 fmaf：dot*scale 若先落地再减 m 就是两次舍入，
         //head_dim 非 4 的幂时（8、32）scale 不是 2 的幂，两种写法差 1 ulp。
@@ -551,7 +567,8 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
       {
         const int kv_start = kb * BN;
         loadKVTile<T, BM, BN>(K_tile, V_tile, k_base, v_base, kv_start,
-                              src_seq_len, kv_stride, head_dim, ty, lane);
+                              block_key_end, kv_stride, head_dim, k_smem_stride,
+                              ty, lane);
         __syncthreads();
         const bool valid = (kv_start + lane) < key_end;
         P_tile[ty * BN + lane] =
@@ -665,15 +682,21 @@ void flashAttention(const std::vector<T>& h_q,
 
 //5.确定分块大小和kernel启动参数
     //smem 用量 = Q、O、K、V 四块（随 head_dim）加 P 一块（BM*BN，与 head_dim 无关）。
-    //head_dim 大时 BM=32 可能装不下，逐档降到 8；BN 固定为 warp 大小不可调。
+    //K 的行距多 kFaSmemPad，必须与 kernel 里的分区算法一致。
     auto smemFor = [head_dim](int bm) -> size_t {
-      const size_t qkvo = (size_t)(2 * bm + 2 * kFaTileN) * head_dim; //Q O K V
-      const size_t p    = (size_t)bm * kFaTileN;                      //P
-      return (qkvo + p) * sizeof(float);
+      const size_t qov = (size_t)(2 * bm + kFaTileN) * head_dim;          //Q O V
+      const size_t k   = (size_t)kFaTileN * (head_dim + kFaSmemPad);      //K
+      const size_t p   = (size_t)bm * kFaTileN;                           //P
+      return (qov + k + p) * sizeof(float);
     };
 
+    //BM 默认取 16：BM=32 是 1024 线程/块，本 kernel 用 40 寄存器，一个 SM 只放得下
+    //1 个块（occupancy 67%）；BM=16 是 512 线程，能放 3 个块跑满 1536 线程。
+    //FLOPs 与 BM 无关（行数×KV块数恒定），代价只是 K/V tile 载入次数翻倍，
+    //实测这笔交换在各形状上稳定赚 3~7%。head_dim 过大时降到 8。
+    //BN 固定为 warp 大小不可调。
     int bm = 0;
-    for (int cand : {32, 16, 8})
+    for (int cand : {16, 8})
       {
         if (smemFor(cand) <= (size_t)ctx.max_smem) { bm = cand; break; }
       }
@@ -690,11 +713,6 @@ void flashAttention(const std::vector<T>& h_q,
     //float 与 half 共用同一个 kernel，只有 BM 随 smem 余量分档
     switch (bm)
       {
-        case 32:
-          flashAttentionKernel<T, 32, kFaTileN><<<grid, block, smemFor(32), ctx.stream>>>
-          (d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads,
-           kv_heads, head_dim, kv_groups, is_causal);
-          break;
         case 16:
           flashAttentionKernel<T, 16, kFaTileN><<<grid, block, smemFor(16), ctx.stream>>>
           (d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads,
