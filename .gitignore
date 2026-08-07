@@ -1,0 +1,13 @@
+# 构建产物（tester/*.o 是作业自带的，不在此列）
+src/*.o
+src/kernels_exec
+test_kernels
+
+# profiler 输出
+*.nsys-rep
+*.sqlite
+
+# 编辑器 / 临时备份
+.vscode/
+*.orig
+*.bak

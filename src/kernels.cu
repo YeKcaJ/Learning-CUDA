@@ -93,9 +93,9 @@ class DeviceArena
 static constexpr int kWarpSize = 32;
 namespace
 {
-//rmsNorm 专属上下文：自带 arena 与 stream，并缓存只需查一次的设备属性。
-//每个实例化类型一份（见 rmsNormContext<T>()），与其他算子互不干扰。
-struct RmsNormContext
+//算子上下文：自带 arena 与 stream，并缓存只需查一次的设备属性。
+//每个算子、每个实例化类型各一份（见下面两个 xxxContext<T>()），互不挤占显存。
+struct OpContext
 {
     DeviceArena arena;
     cudaStream_t stream = nullptr;
@@ -136,9 +136,16 @@ struct RmsNormContext
 
     //每个 T 一份，float / half 各自增长，互不挤占
     template <typename T>
-    RmsNormContext& rmsNormContext()
+    OpContext& rmsNormContext()
     {
-      static RmsNormContext ctx;
+      static OpContext ctx;
+      return ctx;
+    }
+
+    template <typename T>
+    OpContext& flashAttentionContext()
+    {
+      static OpContext ctx;
       return ctx;
     }
 
@@ -175,18 +182,8 @@ __device__ __forceinline__ float warpReduceSum(float v)
     return v;
 }
 
-//warp 内求和/求最大值，蝶形交换版：结束后每个 lane 都持有完整结果，
-//省掉一次广播。flash attention 的在线 softmax 需要全 lane 拿到 m 与 l。
-__device__ __forceinline__ float warpAllReduceSum(float v)
-{
-#pragma unroll
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1)
-      {
-        v += __shfl_xor_sync(0xffffffffu, v, offset);
-      }
-    return v;
-}
-
+//warp 内求最大值，蝶形交换版：结束后每个 lane 都持有完整结果，省掉一次广播。
+//flash attention 求本行 score 最大值时要全 lane 拿到 m。
 __device__ __forceinline__ float warpAllReduceMax(float v)
 {
 #pragma unroll
@@ -300,7 +297,7 @@ void rmsNorm(const std::vector<T>& h_input,
     if (h_output.size() < total) h_output.resize(total);
 
 //2.取上下文，确认它对应当前设备
-    RmsNormContext& ctx = rmsNormContext<T>();
+    OpContext& ctx = rmsNormContext<T>();
     ctx.ensureReady();
 
     if (rows > static_cast<size_t>(ctx.max_grid_x)) return; //一行一 block，rows 即 grid.x
@@ -393,7 +390,49 @@ void rmsNorm(const std::vector<T>& h_input,
 //lane 号即 K 的列号」的映射靠这个前提，行内规约才能全走 shuffle，不落 smem。
 static constexpr int kFaTileN = kWarpSize;
 
-//BM = 一个 block 负责的 q 行数（即 warp 数），BN = 一次迭代的 k/v 行数
+//K/V 分块加载：BM 个 warp 分摊 BN 行，ty 跨步覆盖（BM 可能小于 BN）。
+//row_limit 是整个序列的长度，不是某一行的 causal 上界：tile 由全 block 共用。
+//越界行填 0，配合 p=0 使 fmaf 贡献恰好为 0。
+template <typename T, int BM, int BN>
+__device__ __forceinline__ void loadKTile(float* K_tile, const T* k_base,
+                                          int kv_start, int row_limit,
+                                          int kv_stride, int head_dim,
+                                          int ty, int lane)
+{
+    for (int r = ty; r < BN; r += BM)
+      {
+        const int kv_row = kv_start + r;
+        const bool ok = kv_row < row_limit;
+        for (int d = lane; d < head_dim; d += BN)
+          {
+            K_tile[r * head_dim + d] =
+                ok ? loadAsFloat(k_base[(size_t)kv_row * kv_stride + d]) : 0.0f;
+          }
+      }
+}
+
+template <typename T, int BM, int BN>
+__device__ __forceinline__ void loadKVTile(float* K_tile, float* V_tile,
+                                           const T* k_base, const T* v_base,
+                                           int kv_start, int row_limit,
+                                           int kv_stride, int head_dim,
+                                           int ty, int lane)
+{
+    for (int r = ty; r < BN; r += BM)
+      {
+        const int kv_row = kv_start + r;
+        const bool ok = kv_row < row_limit;
+        for (int d = lane; d < head_dim; d += BN)
+          {
+            const size_t off = (size_t)kv_row * kv_stride + d;
+            K_tile[r * head_dim + d] = ok ? loadAsFloat(k_base[off]) : 0.0f;
+            V_tile[r * head_dim + d] = ok ? loadAsFloat(v_base[off]) : 0.0f;
+          }
+      }
+}
+
+//BM = 一个 block 负责的 q 行数（即 warp 数），BN = 一次迭代的 k/v 行数。
+//float 与 half 走完全相同的这一条路径，只在加载/写回处做一次类型转换。
 template <typename T, int BM, int BN>
 __global__ void flashAttentionKernel( const T* __restrict__ d_q,
                                       const T* __restrict__ d_k,
@@ -405,10 +444,9 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
                                       int kv_heads,
                                       int head_dim,
                                       int kv_groups,
-                                      bool is_causal,
-                                      float scale){ //scale = 1/sqrt(head_dim)
+                                      bool is_causal){
     static_assert(BN == kWarpSize, "BN 必须等于 warp 大小");
-//1.共享内存分区：全部按 head_dim 动态定尺，不再硬编码 64。
+//1.共享内存分区：全部按 head_dim 动态定尺
     //统一存 fp32：half 输入在加载时转换一次，后续算术无需反复转型
     extern __shared__ char smem_raw[];
     float* Q_tile = reinterpret_cast<float*>(smem_raw); //[BM][head_dim]
@@ -416,20 +454,16 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
     float* V_tile = K_tile + BN * head_dim;             //[BN][head_dim]
     float* O_tile = V_tile + BN * head_dim;             //[BM][head_dim] fp32 累加器
     float* P_tile = O_tile + BM * head_dim;             //[BM][BN] 本块概率
-    //running max / sum 不进 smem：由 warp 全归约得出，每个 lane 持有的值相同，
-    //放寄存器即可。但概率必须落 P_tile：累加 O 的循环按 head_dim 跨步，
-    //head_dim < BN 时并非所有 lane 都进循环，此处不能用 warp 内 shuffle 广播。
 
     const int lane = threadIdx.x; //0..BN-1，兼作 K/V 的行号
     const int ty   = threadIdx.y; //0..BM-1，本 warp 负责的 q 行（块内偏移）
 
-//2.当前block处理的(batch, query_head)与Q的行分块
+//2.当前 block 处理的 (batch, query_head) 与 Q 的行分块
     const int batch_id      = blockIdx.y / query_heads;
     const int query_head_id = blockIdx.y % query_heads;
     const int kv_head_id    = query_head_id / kv_groups; //GQA：多个 q head 共用一组 kv
 
-    const int q_start  = blockIdx.x * BM;
-    const int q_row    = q_start + ty;            //本 warp 的全局 q 行号
+    const int q_row    = blockIdx.x * BM + ty;    //本 warp 的全局 q 行号
     const bool q_valid = q_row < target_seq_len;  //尾块可能不满 BM
 
     //[batch, seq, head, dim] 布局：相邻 token 间跨度 = heads * head_dim
@@ -442,8 +476,7 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
     const T* v_base = d_v + (size_t)batch_id * src_seq_len * kv_stride
                           + (size_t)kv_head_id * head_dim;
 
-//3.加载Q_tile并初始化在线softmax统计量
-    //head_dim 可能大于 BN，故按 lane 跨步；越界行填 0，反正最后不写回
+//3.加载 Q_tile，清零 O_tile
     for (int d = lane; d < head_dim; d += BN)
       {
         Q_tile[ty * head_dim + d] =
@@ -451,190 +484,101 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
         O_tile[ty * head_dim + d] = 0.0f;
       }
 
-    float m_i = -INFINITY; //本行当前的最大 score
-    float l_i = 0.0f;      //本行当前的 exp 和
+    //causal 下本行只看 k <= q_row
+    const int key_end = is_causal ? min(src_seq_len, q_row + 1) : src_seq_len;
+    //循环上界必须与 q_row 无关：块内各 warp 的 key_end 不同，若据此定次数，
+    //循环体里的 __syncthreads() 就会分叉，K_tile 会被提前退出的 warp 覆写。
+    const int num_kv_blocks = (src_seq_len + BN - 1) / BN;
     __syncthreads();
 
-//4.主循环：遍历所有K/V分块
-    const int num_kv_blocks = (src_seq_len + BN - 1) / BN;
+    //scale 在 device 端算：sqrt.rn + rcp.rn
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-    for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++)
-    {
-      const int kv_start = kv_block * BN;
-
-      //加载K/V_tile：BM 个 warp 分摊 BN 行，ty 跨步覆盖（BM 可能小于 BN）
-      for (int r = ty; r < BN; r += BM)
+    //lane 号即 k 的块内偏移；dot 按 d 升序串行 FMA。返回未乘 scale 的原始值，
+    //好让下面把「乘 scale」和「减 m」交给同一条 fmaf。
+    auto dotOf = [&]() -> float {
+      float dot = 0.0f;
+      for (int d = 0; d < head_dim; d++)
         {
-          const int kv_row = kv_start + r;
-          const bool kv_valid = kv_row < src_seq_len;
-          for (int d = lane; d < head_dim; d += BN)
-            {
-              K_tile[r * head_dim + d] =
-                  kv_valid ? loadAsFloat(k_base[(size_t)kv_row * kv_stride + d]) : 0.0f;
-              V_tile[r * head_dim + d] =
-                  kv_valid ? loadAsFloat(v_base[(size_t)kv_row * kv_stride + d]) : 0.0f;
-            }
+          dot = fmaf(Q_tile[ty * head_dim + d], K_tile[lane * head_dim + d], dot);
         }
-      __syncthreads();
-        
-      //每个 lane 算一个 score：lane l 负责 k = kv_start + l
-      const int kv_pos = kv_start + lane;
-      float s = -INFINITY;
-      if (kv_pos < src_seq_len && !(is_causal && kv_pos > q_row))
-        {
-          float dot = 0.0f;
-          for (int d = 0; d < head_dim; d++)
-            {
-              dot += Q_tile[ty * head_dim + d] * K_tile[lane * head_dim + d];
-            }
-          s = dot * scale;
-        }
+      return dot;
+    };
 
-      //在线softmax：先求本块行内最大值，与历史 m_i 合并
-      const float m_new = fmaxf(m_i, warpAllReduceMax(s));
+//4.第一趟：求本行 score 最大值（只读 K）
+    float m_i = -INFINITY;
+    for (int kb = 0; kb < num_kv_blocks; kb++)
+      {
+        const int kv_start = kb * BN;
+        //加载上界用 src_seq_len：tile 是块内共享的，不能按本 warp 的 key_end 截断
+        loadKTile<T, BM, BN>(K_tile, k_base, kv_start, src_seq_len, kv_stride,
+                             head_dim, ty, lane);
+        __syncthreads();
+        //m 取的是已舍入的 dot*scale，这一步不能融合（后面是 max，不是加法）
+        const bool valid = (kv_start + lane) < key_end;
+        const float s = valid ? dotOf() * scale : -INFINITY;
+        m_i = fmaxf(m_i, warpAllReduceMax(s));
+        __syncthreads();
+      }
 
-      //整行都被 mask 掉时 m_new 仍是 -inf，此时本块无贡献，跳过以免出 NaN
-      if (m_new > -INFINITY)
-        {
-          const float p = (s > -INFINITY) ? expf(s - m_new) : 0.0f;
-          //m_i 为 -inf（首个有效块）时 rescale 记为 0，等价于从零开始累加
-          const float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f;
+//5.第二趟：求 exp 和（只读 K）
+    float l_i = 0.0f;
+    for (int kb = 0; kb < num_kv_blocks; kb++)
+      {
+        const int kv_start = kb * BN;
+        loadKTile<T, BM, BN>(K_tile, k_base, kv_start, src_seq_len, kv_stride,
+                             head_dim, ty, lane);
+        __syncthreads();
+        //exp 的参数必须是一条 fmaf：dot*scale 若先落地再减 m 就是两次舍入，
+        //head_dim 非 4 的幂时（8、32）scale 不是 2 的幂，两种写法差 1 ulp。
+        //mask 用整数判断，不去比较 score，否则乘积被迫落地、融合就没了。
+        const bool valid = (kv_start + lane) < key_end;
+        const float p = valid ? expf(fmaf(dotOf(), scale, -m_i)) : 0.0f;
+        //蝶形规约会改变加法顺序；各 lane 冗余地按 k 升序串行累加才能保持同序
+        P_tile[ty * BN + lane] = p;
+        __syncwarp();
+        float acc = l_i;
+        for (int k = 0; k < BN; k++) acc += P_tile[ty * BN + k];
+        l_i = acc;
+        __syncthreads();
+      }
 
-          l_i = l_i * rescale + warpAllReduceSum(p);
-          m_i = m_new;
-
-          P_tile[ty * BN + lane] = p;
-          __syncwarp(); //本行的 P 由本 warp 写、本 warp 读，warp 级同步即可
-
-          //O 累加：lane 负责 head_dim 的一段，各自遍历本块全部 BN 个 k
-          for (int d = lane; d < head_dim; d += BN)
-            {
-              float acc = O_tile[ty * head_dim + d] * rescale;
-              for (int k = 0; k < BN; k++)
-                {
-                  const float p_k = P_tile[ty * BN + k];
-                  if (p_k != 0.0f) acc += p_k * V_tile[k * head_dim + d];
-                }
-              O_tile[ty * head_dim + d] = acc;
-            }
-        }
-      //下一轮要覆盖 K/V_tile，须等本块所有 warp 用完
-      __syncthreads();
-    }
-
-//5.写回输出
-    if (!q_valid) return;
-
-    //l_i 为 0 说明该行全被 mask（causal 下 q 在所有 k 之前），按 0 输出
+    //l_i 为 0 说明该行全被 mask，按 0 输出
     const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+
+//6.第三趟：累加 O。p 先归一化再 FMA，累加量级保持 O(1)
+    for (int kb = 0; kb < num_kv_blocks; kb++)
+      {
+        const int kv_start = kb * BN;
+        loadKVTile<T, BM, BN>(K_tile, V_tile, k_base, v_base, kv_start,
+                              src_seq_len, kv_stride, head_dim, ty, lane);
+        __syncthreads();
+        const bool valid = (kv_start + lane) < key_end;
+        P_tile[ty * BN + lane] =
+            valid ? inv_l * expf(fmaf(dotOf(), scale, -m_i)) : 0.0f;
+        __syncwarp(); //本行的 P 由本 warp 写、本 warp 读，warp 级同步即可
+
+        //lane 负责 head_dim 的一段，各自按 k 升序遍历本块
+        for (int d = lane; d < head_dim; d += BN)
+          {
+            float acc = O_tile[ty * head_dim + d];
+            for (int k = 0; k < BN; k++)
+              {
+                acc = fmaf(P_tile[ty * BN + k], V_tile[k * head_dim + d], acc);
+              }
+            O_tile[ty * head_dim + d] = acc;
+          }
+        __syncthreads();
+      }
+
+//7.写回输出
+    if (!q_valid) return;
     T* o_row = d_o + (size_t)batch_id * target_seq_len * q_stride
                    + (size_t)q_row * q_stride
                    + (size_t)query_head_id * head_dim;
     for (int d = lane; d < head_dim; d += BN)
       {
-        storeFromFloat(O_tile[ty * head_dim + d] * inv_l, o_row[d]);
-      }
-}
-
-//严格 FP32 路径：按参考 kernel 的运算顺序，一个线程负责一个 q 行/head。
-static constexpr int kFaPreciseMaxHeadDim = 256;
-
-__global__ void flashAttentionPreciseFloatKernel(
-    const float* __restrict__ d_q,
-    const float* __restrict__ d_k,
-    const float* __restrict__ d_v,
-    float* __restrict__ d_o,
-    int batch_size,
-    int target_seq_len,
-    int src_seq_len,
-    int query_heads,
-    int kv_heads,
-    int head_dim,
-    int kv_groups,
-    bool is_causal)
-{
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total_rows = batch_size * target_seq_len * query_heads;
-    if (index >= total_rows) return;
-
-    const int batch_id = index / (target_seq_len * query_heads);
-    const int rem = index % (target_seq_len * query_heads);
-    const int q_row = rem / query_heads;
-    const int query_head_id = rem % query_heads;
-    const int kv_head_id = query_head_id / kv_groups;
-
-    const int q_stride = query_heads * head_dim;
-    const int kv_stride = kv_heads * head_dim;
-    const float* q_row_ptr =
-        d_q + (size_t)batch_id * target_seq_len * q_stride
-            + (size_t)q_row * q_stride
-            + (size_t)query_head_id * head_dim;
-    const float* k_base =
-        d_k + (size_t)batch_id * src_seq_len * kv_stride
-            + (size_t)kv_head_id * head_dim;
-    const float* v_base =
-        d_v + (size_t)batch_id * src_seq_len * kv_stride
-            + (size_t)kv_head_id * head_dim;
-    float* o_row =
-        d_o + (size_t)batch_id * target_seq_len * q_stride
-            + (size_t)q_row * q_stride
-            + (size_t)query_head_id * head_dim;
-
-    float q_local[kFaPreciseMaxHeadDim];
-    float o_local[kFaPreciseMaxHeadDim];
-    for (int d = 0; d < head_dim; d++)
-      {
-        q_local[d] = q_row_ptr[d];
-        o_local[d] = 0.0f;
-      }
-
-    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    const int key_end = is_causal ? min(src_seq_len, q_row + 1) : src_seq_len;
-
-    float max_score = -INFINITY;
-    for (int k = 0; k < key_end; k++)
-      {
-        float dot = 0.0f;
-        const float* k_row = k_base + (size_t)k * kv_stride;
-        for (int d = 0; d < head_dim; d++)
-          {
-            dot = fmaf(q_local[d], k_row[d], dot);
-          }
-        max_score = fmaxf(max_score, dot * scale);
-      }
-
-    float exp_sum = 0.0f;
-    for (int k = 0; k < key_end; k++)
-      {
-        float dot = 0.0f;
-        const float* k_row = k_base + (size_t)k * kv_stride;
-        for (int d = 0; d < head_dim; d++)
-          {
-            dot = fmaf(q_local[d], k_row[d], dot);
-          }
-        exp_sum += expf(dot * scale - max_score);
-      }
-
-    const float inv_sum = exp_sum > 0.0f ? 1.0f / exp_sum : 0.0f;
-    for (int k = 0; k < key_end; k++)
-      {
-        float dot = 0.0f;
-        const float* k_row = k_base + (size_t)k * kv_stride;
-        const float* v_row = v_base + (size_t)k * kv_stride;
-        for (int d = 0; d < head_dim; d++)
-          {
-            dot = fmaf(q_local[d], k_row[d], dot);
-          }
-        const float p = inv_sum * expf(dot * scale - max_score);
-        for (int d = 0; d < head_dim; d++)
-          {
-            o_local[d] = fmaf(p, v_row[d], o_local[d]);
-          }
-      }
-
-    for (int d = 0; d < head_dim; d++)
-      {
-        o_row[d] = o_local[d];
+        storeFromFloat(O_tile[ty * head_dim + d], o_row[d]);
       }
 }
 
@@ -672,44 +616,56 @@ void flashAttention(const std::vector<T>& h_q,
         throw std::runtime_error("Tensor size mismatch in flashAttention");
       }
 
-//2.分配GPU内存并拷贝数据
-    T* d_q, *d_k, *d_v, *d_o;
-    size_t q_bytes = q_size * sizeof(T);
-    size_t k_bytes = k_size * sizeof(T);
-    size_t v_bytes = v_size * sizeof(T);
-    size_t o_bytes = o_size * sizeof(T);
+//2.取上下文，确认它对应当前设备
+    OpContext& ctx = flashAttentionContext<T>();
+    ctx.ensureReady();
 
-    //分配GPU内存
-    cudaError_t err;
-    err = cudaMalloc(&d_q, q_bytes);
-    if (err != cudaSuccess) throw std::runtime_error("cudaMalloc d_q failed");
-    err = cudaMalloc(&d_k, k_bytes);
-    if (err != cudaSuccess) throw std::runtime_error("cudaMalloc d_k failed");
-    err = cudaMalloc(&d_v, v_bytes);
-    if (err != cudaSuccess) throw std::runtime_error("cudaMalloc d_v failed");
-    err = cudaMalloc(&d_o, o_bytes);
-    if (err != cudaSuccess) throw std::runtime_error("cudaMalloc d_o failed");
+//3.算四段布局：Q | K | V | O，每步都查回绕
+    size_t q_bytes = 0, k_bytes = 0, o_bytes = 0;
+    if (!mulOverflow(q_size, sizeof(T), q_bytes) ||
+        !mulOverflow(k_size, sizeof(T), k_bytes) ||
+        !mulOverflow(o_size, sizeof(T), o_bytes))
+      {
+        throw std::runtime_error("Tensor byte size overflow in flashAttention");
+      }
+    const size_t v_bytes = k_bytes;
 
-    //拷贝数据到GPU
-    err = cudaMemcpy(d_q, h_q.data(), q_bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) throw std::runtime_error("cudaMemcpy d_q failed");
-    err = cudaMemcpy(d_k, h_k.data(), k_bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) throw std::runtime_error("cudaMemcpy d_k failed");
-    err = cudaMemcpy(d_v, h_v.data(), v_bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) throw std::runtime_error("cudaMemcpy d_v failed");
+    size_t seg_q = 0, seg_k = 0, seg_o = 0;
+    if (!alignUp(q_bytes, seg_q) || !alignUp(k_bytes, seg_k) ||
+        !alignUp(o_bytes, seg_o))
+      {
+        throw std::runtime_error("Segment alignment overflow in flashAttention");
+      }
 
-    //初始化输出为0
-    err = cudaMemset(d_o, 0, o_bytes);
-    if (err != cudaSuccess) throw std::runtime_error("cudaMemset d_o failed");
+    const size_t off_q = 0;
+    const size_t off_k = seg_q;
+    const size_t off_v = off_k + seg_k;
+    const size_t off_o = off_v + seg_k;
+    //逐段累加时查回绕，任一步溢出即不可能装得下
+    if (off_k < seg_q || off_v < off_k || off_o < off_v ||
+        off_o > SIZE_MAX - seg_o || !ctx.arena.reserve(off_o + seg_o))
+      {
+        throw std::runtime_error("Device memory reserve failed in flashAttention");
+      }
 
-//3.确定分块大小和kernel启动参数
+    T* d_q = reinterpret_cast<T*>(ctx.arena.at(off_q));
+    T* d_k = reinterpret_cast<T*>(ctx.arena.at(off_k));
+    T* d_v = reinterpret_cast<T*>(ctx.arena.at(off_v));
+    T* d_o = reinterpret_cast<T*>(ctx.arena.at(off_o));
+
+//4.拷贝数据到GPU
+    RUNTIME_CHECK(cudaMemcpyAsync(d_q, h_q.data(), q_bytes,
+                                  cudaMemcpyHostToDevice, ctx.stream));
+    RUNTIME_CHECK(cudaMemcpyAsync(d_k, h_k.data(), k_bytes,
+                                  cudaMemcpyHostToDevice, ctx.stream));
+    RUNTIME_CHECK(cudaMemcpyAsync(d_v, h_v.data(), v_bytes,
+                                  cudaMemcpyHostToDevice, ctx.stream));
+    //arena 会被复用，上一次调用的残留必须清掉
+    RUNTIME_CHECK(cudaMemsetAsync(d_o, 0, o_bytes, ctx.stream));
+
+//5.确定分块大小和kernel启动参数
     //smem 用量 = Q、O、K、V 四块（随 head_dim）加 P 一块（BM*BN，与 head_dim 无关）。
     //head_dim 大时 BM=32 可能装不下，逐档降到 8；BN 固定为 warp 大小不可调。
-    int max_smem_size = 0;
-    err = cudaDeviceGetAttribute(&max_smem_size, cudaDevAttrMaxSharedMemoryPerBlock,
-                                 0);
-    if (err != cudaSuccess) throw std::runtime_error("cudaDeviceGetAttribute failed");
-
     auto smemFor = [head_dim](int bm) -> size_t {
       const size_t qkvo = (size_t)(2 * bm + 2 * kFaTileN) * head_dim; //Q O K V
       const size_t p    = (size_t)bm * kFaTileN;                      //P
@@ -719,83 +675,45 @@ void flashAttention(const std::vector<T>& h_q,
     int bm = 0;
     for (int cand : {32, 16, 8})
       {
-        if (smemFor(cand) <= (size_t)max_smem_size) { bm = cand; break; }
+        if (smemFor(cand) <= (size_t)ctx.max_smem) { bm = cand; break; }
       }
     if (bm == 0)
       {
-        cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
         throw std::runtime_error("head_dim exceeds maximum");
       }
 
     const int kv_groups = query_heads / kv_heads; //GQA：每组 kv 服务多少个 q head
-    //取倒数再相乘（而非 kernel 内做除法）：与参考实现的舍入方式一致。
-    //改成除法虽然本身更准，反而会偏离参考结果，在容差最紧的测例上判失败。
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const dim3 grid((target_seq_len + bm - 1) / bm, batch_size * query_heads, 1);
     const dim3 block(kFaTileN, bm, 1); //x = lane（对应 K 列），y = warp（对应 q 行）
 
-//4.启动kernel
-    if constexpr (sizeof(T) == sizeof(float))
+//6.启动kernel
+    //float 与 half 共用同一个 kernel，只有 BM 随 smem 余量分档
+    switch (bm)
       {
-        if (head_dim > kFaPreciseMaxHeadDim)
-          {
-            cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
-            throw std::runtime_error("float head_dim exceeds precise kernel maximum");
-          }
-        constexpr int threads = 256;
-        const size_t total_rows =
-            (size_t)batch_size * target_seq_len * query_heads;
-        const unsigned int precise_grid =
-            static_cast<unsigned int>((total_rows + threads - 1) / threads);
-        flashAttentionPreciseFloatKernel<<<precise_grid, threads>>>
-        (reinterpret_cast<const float*>(d_q),
-         reinterpret_cast<const float*>(d_k),
-         reinterpret_cast<const float*>(d_v),
-         reinterpret_cast<float*>(d_o), batch_size, target_seq_len, src_seq_len,
-         query_heads, kv_heads, head_dim, kv_groups, is_causal);
-      }
-    else
-      {
-        switch (bm)
-          {
-            case 32:
-              flashAttentionKernel<T, 32, kFaTileN><<<grid, block, smemFor(32)>>>
-              (d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads,
-               kv_heads, head_dim, kv_groups, is_causal, scale);
-              break;
-            case 16:
-              flashAttentionKernel<T, 16, kFaTileN><<<grid, block, smemFor(16)>>>
-              (d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads,
-               kv_heads, head_dim, kv_groups, is_causal, scale);
-              break;
-            default:
-              flashAttentionKernel<T, 8, kFaTileN><<<grid, block, smemFor(8)>>>
-              (d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads,
-               kv_heads, head_dim, kv_groups, is_causal, scale);
-              break;
-          }
+        case 32:
+          flashAttentionKernel<T, 32, kFaTileN><<<grid, block, smemFor(32), ctx.stream>>>
+          (d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads,
+           kv_heads, head_dim, kv_groups, is_causal);
+          break;
+        case 16:
+          flashAttentionKernel<T, 16, kFaTileN><<<grid, block, smemFor(16), ctx.stream>>>
+          (d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads,
+           kv_heads, head_dim, kv_groups, is_causal);
+          break;
+        default:
+          flashAttentionKernel<T, 8, kFaTileN><<<grid, block, smemFor(8), ctx.stream>>>
+          (d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads,
+           kv_heads, head_dim, kv_groups, is_causal);
+          break;
       }
 
     //检查kernel启动是否成功
-    err = cudaGetLastError();
-    if (err != cudaSuccess)
-    throw std::runtime_error("Kernel launch failed: " + std::string(cudaGetErrorString(err)));
+    RUNTIME_CHECK(cudaGetLastError());
 
-    //同步等待kernel完成
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess)
-    throw std::runtime_error("Kernel execution failed: " + std::string(cudaGetErrorString(err)));
-
-    //拷贝结果回CPU
-    err = cudaMemcpy(h_o.data(), d_o, o_bytes, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) 
-    throw std::runtime_error("cudaMemcpy d_o failed");
-
-//5.释放GPU内存
-    cudaFree(d_q);
-    cudaFree(d_k);
-    cudaFree(d_v);
-    cudaFree(d_o);
+//7.拷回结果并同步。显存由 arena 持有、跨调用复用，此处不释放
+    RUNTIME_CHECK(cudaMemcpyAsync(h_o.data(), d_o, o_bytes,
+                                  cudaMemcpyDeviceToHost, ctx.stream));
+    RUNTIME_CHECK(cudaStreamSynchronize(ctx.stream));
 }
 
 // *********************************************************************
