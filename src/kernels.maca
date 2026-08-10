@@ -31,7 +31,7 @@ class DeviceArena
 {
     public:
     //绑定所属设备与流。use_pool 为真时走 mcMallocAsync（需 probe 先确认可用），
-    //由调用方查询 mcDevAttrMemoryPoolsSupported 后传入
+    //由调用方查询 mcDeviceAttributeMemoryPoolsSupported 后传入
     void bind(int device, mcStream_t stream, bool use_pool)
     {
         device_ = device;
@@ -137,13 +137,13 @@ struct OpContext
 
         device = cur;
         RUNTIME_CHECK(mcStreamCreate(&stream));
-        RUNTIME_CHECK(mcDeviceGetAttribute(&max_smem, mcDevAttrMaxSharedMemoryPerBlock, device));
-        RUNTIME_CHECK(mcDeviceGetAttribute(&max_grid_x, mcDevAttrMaxGridDimX, device));
-        RUNTIME_CHECK(mcDeviceGetAttribute(&max_threads, mcDevAttrMaxThreadsPerBlock, device));
+        RUNTIME_CHECK(mcDeviceGetAttribute(&max_smem, mcDeviceAttributeMaxSharedMemoryPerBlock, device));
+        RUNTIME_CHECK(mcDeviceGetAttribute(&max_grid_x, mcDeviceAttributeMaxGridDimX, device));
+        RUNTIME_CHECK(mcDeviceGetAttribute(&max_threads, mcDeviceAttributeMaxThreadsPerBlock, device));
 
         //内存池须运行时确认
         int pools = 0;
-        RUNTIME_CHECK(mcDeviceGetAttribute(&pools, mcDevAttrMemoryPoolsSupported, device));
+        RUNTIME_CHECK(mcDeviceGetAttribute(&pools, mcDeviceAttributeMemoryPoolsSupported, device));
         #if defined(PLATFORM_METAX)
             arena.bind(device, stream, false); //mcMallocAsync 待 probe 确认
         #elif CUDART_VERSION >= 11020
