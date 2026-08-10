@@ -75,8 +75,10 @@ class DeviceArena
 //否则蝶形归约照样编译、照样运行，只是静默地只归约了一半 lane。
 #if defined(PLATFORM_METAX)
     static constexpr int kWarpSize = 64; //MetaX C500: warp=64（probe 实测）
-#elif defined(PLATFORM_MOORE) || defined(PLATFORM_ILUVATAR)
-    static constexpr int kWarpSize = 32; //待 probe 实测确认
+#elif defined(PLATFORM_ILUVATAR)
+    static constexpr int kWarpSize = 64; //Iluvatar BI-V150: warp=64（probe 实测）
+#elif defined(PLATFORM_MOORE)
+    static constexpr int kWarpSize = 32; //Moore Threads（probe 实测）
 #else
     static constexpr int kWarpSize = 32; //NVIDIA：全系 32
 #endif
@@ -86,6 +88,7 @@ class DeviceArena
     using WarpMask = unsigned long long;
     static constexpr WarpMask kFullWarpMask = 0xffffffffffffffffull;
 #else
+    //BI-V150 虽为 64-lane warp，但 probe 证实 0xffffffffu 会覆盖全部 64 lane。
     using WarpMask = unsigned int;
     static constexpr WarpMask kFullWarpMask = 0xffffffffu;
 #endif
