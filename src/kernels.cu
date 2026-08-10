@@ -30,15 +30,6 @@ inline bool alignUp(size_t bytes, size_t& out)
 class DeviceArena
 {
     public:
-    //绑定所属设备与流。use_pool 为真时走 cudaMallocAsync（CUDA 11.2+ 内存池），
-    //由调用方查询 cudaDevAttrMemoryPoolsSupported 后传入
-    void bind(int device, cudaStream_t stream, bool use_pool)
-    {
-        device_ = device;
-        stream_ = stream;
-        use_pool_ = use_pool;
-    }
-
     //容量不足时整块重分配；旧数据无需保留，故直接释放再申请。
     //按 1.5 倍几何增长，避免测例规模递增时反复重分配。
     bool reserve(size_t bytes)
@@ -51,14 +42,7 @@ class DeviceArena
         if (!alignUp(want, want)) return false;
 
         release();
-        if (use_pool_)
-          {//流序分配：与同流上的 kernel、memcpy 自动保序，无需额外同步
-            RUNTIME_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&base_), want, stream_));
-          }
-        else
-          {
-            RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&base_), want));
-          }
+        RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&base_), want));
         capacity_ = want;
         return true;
     }
@@ -66,8 +50,7 @@ class DeviceArena
     void release()
     {
         if (!base_) return;
-        if (use_pool_) RUNTIME_CHECK(cudaFreeAsync(base_, stream_));
-        else           RUNTIME_CHECK(cudaFree(base_));
+        RUNTIME_CHECK(cudaFree(base_));
         base_ = nullptr;
         capacity_ = 0;
     }
@@ -80,9 +63,6 @@ class DeviceArena
     private:
     char* base_ = nullptr;
     size_t capacity_ = 0;
-    int device_ = -1;
-    cudaStream_t stream_ = nullptr;
-    bool use_pool_ = false;
     //析构时刻意不释放：静态对象销毁可能晚于 CUDA runtime 卸载，
     //那时调用 cudaFree 会报错。进程退出由驱动统一回收。
 };
@@ -142,20 +122,11 @@ struct OpContext
 
         device = cur;
         RUNTIME_CHECK(cudaStreamCreate(&stream));
-        RUNTIME_CHECK(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, device));
-        RUNTIME_CHECK(cudaDeviceGetAttribute(&max_grid_x, cudaDevAttrMaxGridDimX, device));
-        RUNTIME_CHECK(cudaDeviceGetAttribute(&max_threads, cudaDevAttrMaxThreadsPerBlock, device));
-
-        //内存池须运行时确认：各平台对 cudaMallocAsync 的支持不一致
-        int pools = 0;
-        RUNTIME_CHECK(cudaDeviceGetAttribute(&pools, cudaDevAttrMemoryPoolsSupported, device));
-        #if defined(PLATFORM_ILUVATAR) || defined(PLATFORM_METAX)
-            arena.bind(device, stream, false); //cudaMallocAsync 待 probe 确认
-        #elif CUDART_VERSION >= 11020
-            arena.bind(device, stream, pools != 0);
-        #else
-            arena.bind(device, stream, false);
-        #endif
+        cudaDeviceProp props;
+        RUNTIME_CHECK(cudaGetDeviceProperties(&props, device));
+        max_smem = static_cast<int>(props.sharedMemPerBlock);
+        max_grid_x = props.maxGridSize[0];
+        max_threads = props.maxThreadsPerBlock;
     }
 };
 
