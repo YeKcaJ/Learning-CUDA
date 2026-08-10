@@ -25,7 +25,7 @@ ifeq ($(PLATFORM),nvidia)
 	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
 else ifeq ($(PLATFORM),iluvatar)
     CC          	:= clang++
-	CFLAGS          := -std=c++17 -O3
+	CFLAGS          := -std=c++17 -O3 --offload-arch=ivcore20
 	DEVFLAGS        := -x ivcore
     TEST_OBJ    	:= tester/tester_iluvatar.o
 	PLATFORM_DEFINE := -DPLATFORM_ILUVATAR
