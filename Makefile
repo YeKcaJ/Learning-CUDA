@@ -14,6 +14,7 @@
 PLATFORM        ?= nvidia
 PLATFORM_DEFINE ?= -DPLATFORM_NVIDIA
 STUDENT_SUFFIX  := cu
+DEVFLAGS        :=
 CFLAGS          := -std=c++17 -O0
 EXTRA_LIBS     	:= 
 
@@ -24,7 +25,8 @@ ifeq ($(PLATFORM),nvidia)
 	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
 else ifeq ($(PLATFORM),iluvatar)
     CC          	:= clang++
-	CFLAGS          := -std=c++17 -O3
+	CFLAGS          := -std=c++17 -O3 --offload-arch=native
+	DEVFLAGS        := -x ivcore
     TEST_OBJ    	:= tester/tester_iluvatar.o
 	PLATFORM_DEFINE := -DPLATFORM_ILUVATAR
 	EXTRA_LIBS		:= -lcudart -I/usr/local/corex/include -L/usr/local/corex/lib64 -fPIC
@@ -100,4 +102,4 @@ $(TARGET): $(STUDENT_OBJ) $(TEST_OBJ)
 # Generate src object: Compile kernels.cu (triggers template instantiation)
 $(STUDENT_OBJ): $(STUDENT_SRC)
 	@echo "=== Compiling student code ($(STUDENT_SRC)) ==="
-	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEVFLAGS) $(PLATFORM_DEFINE) -c $< -o $@
