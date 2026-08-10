@@ -93,21 +93,24 @@ class DeviceArena
 //warp 宽度。移植到 warp 不是 32 的平台时只改这一处；下面的 kFullWarpMask 与
 //flash attention 的 kFaTileN 都由它导出。shuffle 掩码必须覆盖整个 warp，
 //否则蝶形归约照样编译、照样运行，只是静默地只归约了一半 lane。
-//NVIDIA / Iluvatar(天垓100/智铠100) / MetaX(沐曦) / Moore(摩尔) 均按 32 预设，
-//若有平台实测不是 32，改此值同时须改 WarpMask 类型与 kFullWarpMask 值。
-#if defined(PLATFORM_METAX) || defined(PLATFORM_MOORE) || defined(PLATFORM_ILUVATAR)
-    //待 probe 实测确认
-    static constexpr int kWarpSize = 32;
+#if defined(PLATFORM_METAX)
+    static constexpr int kWarpSize = 64; //MetaX C500: warp=64（probe 实测）
+#elif defined(PLATFORM_MOORE) || defined(PLATFORM_ILUVATAR)
+    static constexpr int kWarpSize = 32; //待 probe 实测确认
 #else
     static constexpr int kWarpSize = 32; //NVIDIA：全系 32
 #endif
 //全 warp 掩码。类型必须跟平台 __shfl_*_sync 的形参一致：NVIDIA 是 unsigned，
-//传 64 位进去会被静默截断（-Wall 下是 warning #69-D）。真到 64 宽的平台上，
-//这里连类型一起换成该平台的掩码类型。
-using WarpMask = unsigned int;
-static constexpr WarpMask kFullWarpMask = 0xffffffffu;
-static_assert(kWarpSize == 32,
-              "warp 宽度不是 32 时，须同时改 WarpMask 的类型与 kFullWarpMask 的值，"
+//MetaX 64 宽 warp 须用 64 位类型，否则掩码截断只归约一半 lane。
+#if defined(PLATFORM_METAX)
+    using WarpMask = unsigned long long;
+    static constexpr WarpMask kFullWarpMask = 0xffffffffffffffffull;
+#else
+    using WarpMask = unsigned int;
+    static constexpr WarpMask kFullWarpMask = 0xffffffffu;
+#endif
+static_assert(kWarpSize == 32 || kWarpSize == 64,
+              "kWarpSize 不是 32 或 64，须同时改 WarpMask 的类型与 kFullWarpMask 的值，"
               "并复核 flash attention 的 block 尺寸（kFaTileN * BM <= 每 block 线程上限）");
 namespace
 {

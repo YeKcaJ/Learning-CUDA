@@ -42,6 +42,7 @@ else ifeq ($(PLATFORM),metax)
     TEST_OBJ    	:= tester/tester_metax.o
 	STUDENT_SUFFIX  := maca
 	PLATFORM_DEFINE := -DPLATFORM_METAX
+	EXTRA_LIBS		:= -maca-link
 else
     $(error Unsupported PLATFORM '$(PLATFORM)' (expected: nvidia, iluvatar, moore, metax))
 endif
