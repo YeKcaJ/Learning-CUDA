@@ -47,7 +47,7 @@ int main()
 {
     int dev = 0;
     RUNTIME_CHECK(mcGetDevice(&dev));
-    mcDeviceProp props;
+    mcDeviceProp_t props;
     RUNTIME_CHECK(mcGetDeviceProperties(&props, dev));
 
     printf("=== 设备 ===\n");

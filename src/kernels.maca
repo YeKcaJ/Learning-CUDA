@@ -122,7 +122,7 @@ struct OpContext
 
         device = cur;
         RUNTIME_CHECK(mcStreamCreate(&stream));
-        mcDeviceProp props;
+        mcDeviceProp_t props;
         RUNTIME_CHECK(mcGetDeviceProperties(&props, device));
         max_smem = static_cast<int>(props.sharedMemPerBlock);
         max_grid_x = props.maxGridSize[0];
