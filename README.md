@@ -144,3 +144,33 @@ make PLATFORM=moore
 ## 有疑问？
 
 可以在群里直接询问助教。
+
+## 作业实现与适配总结
+
+### 测试平台与结果
+
+| 平台 | GPU | 测试结果 | Attention #14（float / half） |
+| --- | --- | --- | --- |
+| NVIDIA | GeForce RTX 3060 Laptop GPU | 54 / 54 Passed | 32.137 / 20.633 ms |
+| 摩尔线程 | MTT S5000 80 GB | 54 / 54 Passed | 24.702 / 15.824 ms |
+| 沐曦 | MetaX C500（16 GB 切片实例） | 54 / 54 Passed | 29.816 / 21.317 ms |
+
+三套环境均通过 RMSNorm 13 组和 Attention 14 组的 `float`、`half` 全部测试。以上耗时来自各平台 10 次 profile 的日志，仅作本次运行记录，不作为不同硬件间的严格性能对比。
+
+### 算子思路
+
+- **RMSNorm**：每个 block 处理一行，以 FP32 累加平方和，通过 warp/block 归约计算缩放因子；根据隐藏维度选择 128、256 或 512 线程，并在共享内存足够时缓存输入，兼顾 `float` 与 `half`。
+- **Flash Attention**：一个 warp 负责一行 Query，分块加载 K/V 到共享内存；分三趟完成最大值、softmax 分母和输出累加，避免保存完整注意力矩阵，同时支持 causal mask、GQA 和 FP32 中间累加。
+
+### 国产平台适配与亮点
+
+- 在 NVIDIA 实现基础上分别适配 MUSA 和 MACA 的头文件、运行时 API、数据类型及链接参数，并用独立 probe 确认 warp、shuffle、共享内存和设备属性行为。
+- 使用可复用的显存 arena、尺寸溢出检查、统一共享内存布局和动态 block 选择；K tile 额外 padding 可减少 bank conflict。
+- 针对 Moore 的 32-lane warp 与 MetaX C500 的 64-lane warp 分别配置归约和 shuffle 掩码，最终在两张国产卡上全量通过。
+
+### 适配中遇到的问题
+
+- 国产运行时虽与 CUDA 接口相似，但类型和枚举并不完全一致，例如 MetaX 使用 `mcDeviceProp_t`，链接还需 `-maca-link`。
+- 部分设备属性查询会返回异常值，曾导致算子提前退出、输出全零；改用 `GetDeviceProperties` 并移除异步内存池依赖后恢复正常。
+- warp 宽度或 shuffle 掩码配置错误可能造成静默数值错误甚至 kernel 卡住，必须以目标卡实测为准。
+- 天数平台暂未完成：BI-V150 可执行 `ivcore11`，但提供的测试器为 `ivcore20`，设备镜像不匹配，留待获得对应测试器或环境后继续验证。
