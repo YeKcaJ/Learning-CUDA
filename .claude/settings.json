@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl.exe -d Ubuntu -- bash -lc 'cd /home/jky/Learning-CUDA && diff <\\(sed \"s/common\\\\\\\\/maca_fp16/cuda_fp16/; s/mcMemcpyHostToDevice/cudaMemcpyHostToDevice/g; s/mcMemcpyDeviceToHost/cudaMemcpyDeviceToHost/g; s/mcDevAttrMemoryPoolsSupported/cudaDevAttrMemoryPoolsSupported/g; s/mcDevAttrMaxThreadsPerBlock/cudaDevAttrMaxThreadsPerBlock/g; s/mcDevAttrMaxSharedMemoryPerBlock/cudaDevAttrMaxSharedMemoryPerBlock/g; s/mcDevAttrMaxGridDimX/cudaDevAttrMaxGridDimX/g; s/mcMemcpyAsync/cudaMemcpyAsync/g; s/mcDeviceGetAttribute/cudaDeviceGetAttribute/g; s/mcStreamSynchronize/cudaStreamSynchronize/g; s/mcStreamDestroy/cudaStreamDestroy/g; s/mcStreamCreate/cudaStreamCreate/g; s/mcMemsetAsync/cudaMemsetAsync/g; s/mcMallocAsync/cudaMallocAsync/g; s/mcFreeAsync/cudaFreeAsync/g; s/mcGetLastError/cudaGetLastError/g; s/mcSetDevice/cudaSetDevice/g; s/mcGetDevice/cudaGetDevice/g; s/mcStream_t/cudaStream_t/g; s/mcMalloc\\\\\\\\b/cudaMalloc/g; s/mcFree\\\\\\\\b/cudaFree/g\" src/kernels.maca | sed \"s/需 probe 先确认可用/CUDA 11.2+ 内存池/; s/MC runtime 卸载/CUDA runtime 卸载/; s/mcMallocAsync 待 probe 确认/CUDA 11.2+ 编译不代表当前设备支持/; s/defined\\(PLATFORM_METAX\\)/!defined\\(PLATFORM_METAX\\) \\\\\\\\&\\\\\\\\& false/; s/#elif CUDART_VERSION >= 11020/#if CUDART_VERSION >= 11020/\"\\) src/kernels.cu | head -30')"
+    ]
+  }
+}

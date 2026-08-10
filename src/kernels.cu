@@ -90,7 +90,25 @@ class DeviceArena
 }
 
 
-static constexpr int kWarpSize = 32;
+//warp 宽度。移植到 warp 不是 32 的平台时只改这一处；下面的 kFullWarpMask 与
+//flash attention 的 kFaTileN 都由它导出。shuffle 掩码必须覆盖整个 warp，
+//否则蝶形归约照样编译、照样运行，只是静默地只归约了一半 lane。
+//NVIDIA / Iluvatar(天垓100/智铠100) / MetaX(沐曦) / Moore(摩尔) 均按 32 预设，
+//若有平台实测不是 32，改此值同时须改 WarpMask 类型与 kFullWarpMask 值。
+#if defined(PLATFORM_METAX) || defined(PLATFORM_MOORE) || defined(PLATFORM_ILUVATAR)
+    //待 probe 实测确认
+    static constexpr int kWarpSize = 32;
+#else
+    static constexpr int kWarpSize = 32; //NVIDIA：全系 32
+#endif
+//全 warp 掩码。类型必须跟平台 __shfl_*_sync 的形参一致：NVIDIA 是 unsigned，
+//传 64 位进去会被静默截断（-Wall 下是 warning #69-D）。真到 64 宽的平台上，
+//这里连类型一起换成该平台的掩码类型。
+using WarpMask = unsigned int;
+static constexpr WarpMask kFullWarpMask = 0xffffffffu;
+static_assert(kWarpSize == 32,
+              "warp 宽度不是 32 时，须同时改 WarpMask 的类型与 kFullWarpMask 的值，"
+              "并复核 flash attention 的 block 尺寸（kFaTileN * BM <= 每 block 线程上限）");
 namespace
 {
 //算子上下文：自带 arena 与 stream，并缓存只需查一次的设备属性。
@@ -100,8 +118,9 @@ struct OpContext
     DeviceArena arena;
     cudaStream_t stream = nullptr;
     int device = -1;
-    int max_smem = 0;   //单 block 可用 shared memory 上限
-    int max_grid_x = 0; //grid.x 上限，用于校验 rows
+    int max_smem = 0;    //单 block 可用 shared memory 上限
+    int max_grid_x = 0;  //grid.x 上限，用于校验 rows
+    int max_threads = 0; //单 block 线程上限，用于给 flash attention 的 BN*BM 设限
 
     //首次调用或当前设备变更时（重）初始化
     void ensureReady()
@@ -122,11 +141,14 @@ struct OpContext
         RUNTIME_CHECK(cudaStreamCreate(&stream));
         RUNTIME_CHECK(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, device));
         RUNTIME_CHECK(cudaDeviceGetAttribute(&max_grid_x, cudaDevAttrMaxGridDimX, device));
+        RUNTIME_CHECK(cudaDeviceGetAttribute(&max_threads, cudaDevAttrMaxThreadsPerBlock, device));
 
-        //内存池须运行时确认：CUDA 11.2+ 编译不代表当前设备支持
+        //内存池须运行时确认：各平台对 cudaMallocAsync 的支持不一致
         int pools = 0;
         RUNTIME_CHECK(cudaDeviceGetAttribute(&pools, cudaDevAttrMemoryPoolsSupported, device));
-        #if CUDART_VERSION >= 11020
+        #if defined(PLATFORM_ILUVATAR) || defined(PLATFORM_METAX)
+            arena.bind(device, stream, false); //cudaMallocAsync 待 probe 确认
+        #elif CUDART_VERSION >= 11020
             arena.bind(device, stream, pools != 0);
         #else
             arena.bind(device, stream, false);
@@ -171,13 +193,23 @@ __device__ __forceinline__ void storeFromFloat(float v, half& dst)
     dst = __float2half(v);
 }
 
+//shuffle 的两层薄封装：掩码统一走 kFullWarpMask，换平台时只有这两行需要改
+__device__ __forceinline__ float shflDown(float v, int offset)
+{
+    return __shfl_down_sync(kFullWarpMask, v, offset);
+}
+__device__ __forceinline__ float shflXor(float v, int offset)
+{
+    return __shfl_xor_sync(kFullWarpMask, v, offset);
+}
+
 //warp 内求和
 __device__ __forceinline__ float warpReduceSum(float v)
 {
 #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1)
       {
-        v += __shfl_down_sync(0xffffffffu, v, offset);
+        v += shflDown(v, offset);
       }
     return v;
 }
@@ -189,7 +221,7 @@ __device__ __forceinline__ float warpAllReduceMax(float v)
 #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1)
       {
-        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+        v = fmaxf(v, shflXor(v, offset));
       }
     return v;
 }
@@ -396,6 +428,43 @@ static constexpr int kFaTileN = kWarpSize;
 //V_tile 不需要：它按 [k * head_dim + d] 取，d = lane 本就连续。
 static constexpr int kFaSmemPad = 1;
 
+//FaSmemLayout / faSmemLayout
+//shared memory 布局。host 端要总字节数（启动参数），kernel 端要各段起点，两边
+//必须严格一致——但 extern __shared__ 是裸指针，第三个启动参数只申请内存、不约束
+//kernel 里怎么寻址，两边算得不一样时不会报错，只静默越界，还能跑过全部测例。
+//所以这份算术只写一遍，两边都从这里取。
+struct FaSmemLayout
+{
+    int k_stride;  //K 的行距，含 padding
+    int q_off;     //以下均为 float 为单位的段起点
+    int k_off;
+    int v_off;
+    int o_off;
+    int p_off;
+    int floats;    //总 float 数
+};
+
+//bn 恒为 kFaTileN，显式入参是为了让 host 端选 BM 时能复用同一个函数
+__host__ __device__ __forceinline__
+FaSmemLayout faSmemLayout(int bm, int bn, int head_dim)
+{
+    FaSmemLayout L;
+    L.k_stride = head_dim + kFaSmemPad;
+    L.q_off    = 0;                            //[bm][head_dim]
+    L.k_off    = L.q_off + bm * head_dim;      //[bn][k_stride]
+    L.v_off    = L.k_off + bn * L.k_stride;    //[bn][head_dim]
+    L.o_off    = L.v_off + bn * head_dim;      //[bm][head_dim] fp32 累加器
+    L.p_off    = L.o_off + bm * head_dim;      //[bm][bn] 本块概率
+    L.floats   = L.p_off + bm * bn;
+    return L;
+}
+
+__host__ __device__ __forceinline__
+size_t faSmemBytes(int bm, int bn, int head_dim)
+{
+    return (size_t)faSmemLayout(bm, bn, head_dim).floats * sizeof(float);
+}
+
 //K/V 分块加载：BM 个 warp 分摊 BN 行，ty 跨步覆盖（BM 可能小于 BN）。
 //row_limit 是整个序列的长度，不是某一行的 causal 上界：tile 由全 block 共用。
 //越界行填 0，配合 p=0 使 fmaf 贡献恰好为 0。
@@ -455,13 +524,15 @@ __global__ void flashAttentionKernel( const T* __restrict__ d_q,
 //1.共享内存分区：全部按 head_dim 动态定尺
     //统一存 fp32：half 输入在加载时转换一次，后续算术无需反复转型
     extern __shared__ char smem_raw[];
-    //只有 K 的行距带 padding，用来消掉点积内层的 bank conflict（见 kFaSmemPad）
-    const int k_smem_stride = head_dim + kFaSmemPad;
-    float* Q_tile = reinterpret_cast<float*>(smem_raw); //[BM][head_dim]
-    float* K_tile = Q_tile + BM * head_dim;             //[BN][head_dim + pad]
-    float* V_tile = K_tile + BN * k_smem_stride;        //[BN][head_dim]
-    float* O_tile = V_tile + BN * head_dim;             //[BM][head_dim] fp32 累加器
-    float* P_tile = O_tile + BM * head_dim;             //[BM][BN] 本块概率
+    //段起点与 K 行距都取自 faSmemLayout，host 端的启动参数出自同一函数
+    const FaSmemLayout smem = faSmemLayout(BM, BN, head_dim);
+    const int k_smem_stride = smem.k_stride;
+    float* smem_f  = reinterpret_cast<float*>(smem_raw);
+    float* Q_tile = smem_f + smem.q_off;
+    float* K_tile = smem_f + smem.k_off;
+    float* V_tile = smem_f + smem.v_off;
+    float* O_tile = smem_f + smem.o_off;
+    float* P_tile = smem_f + smem.p_off;
 
     const int lane = threadIdx.x; //0..BN-1，兼作 K/V 的行号
     const int ty   = threadIdx.y; //0..BM-1，本 warp 负责的 q 行（块内偏移）
@@ -681,13 +752,9 @@ void flashAttention(const std::vector<T>& h_q,
     RUNTIME_CHECK(cudaMemsetAsync(d_o, 0, o_bytes, ctx.stream));
 
 //5.确定分块大小和kernel启动参数
-    //smem 用量 = Q、O、K、V 四块（随 head_dim）加 P 一块（BM*BN，与 head_dim 无关）。
-    //K 的行距多 kFaSmemPad，必须与 kernel 里的分区算法一致。
+    //smem 总量与 kernel 内的分段同出于 faSmemLayout，不再各算一遍
     auto smemFor = [head_dim](int bm) -> size_t {
-      const size_t qov = (size_t)(2 * bm + kFaTileN) * head_dim;          //Q O V
-      const size_t k   = (size_t)kFaTileN * (head_dim + kFaSmemPad);      //K
-      const size_t p   = (size_t)bm * kFaTileN;                           //P
-      return (qov + k + p) * sizeof(float);
+      return faSmemBytes(bm, kFaTileN, head_dim);
     };
 
     //BM 默认取 16：BM=32 是 1024 线程/块，本 kernel 用 40 寄存器，一个 SM 只放得下
@@ -695,9 +762,13 @@ void flashAttention(const std::vector<T>& h_q,
     //FLOPs 与 BM 无关（行数×KV块数恒定），代价只是 K/V tile 载入次数翻倍，
     //实测这笔交换在各形状上稳定赚 3~7%。head_dim 过大时降到 8。
     //BN 固定为 warp 大小不可调。
+    //除 smem 外还要过线程数这一关：block 是 (kFaTileN, bm)，即 warp 宽 × bm 个 warp。
+    //32 宽的 warp 上 16×32=512 从来不会顶到上限，但 64 宽的平台上就是 1024，
+    //若该平台每 block 只允许 512，这一档必须跳过。
     int bm = 0;
     for (int cand : {16, 8})
       {
+        if (kFaTileN * cand > ctx.max_threads) continue;
         if (smemFor(cand) <= (size_t)ctx.max_smem) { bm = cand; break; }
       }
     if (bm == 0)
