@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/cpu_nvfp4.dir/main.cpp.o -o cpu_nvfp4 
