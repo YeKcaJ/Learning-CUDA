@@ -83,7 +83,7 @@ def main():
         "# 性能测试结果",
         "",
         "GPU 驻留计时使用 CUDA event；host_api 包括量化的分配、传输和释放。",
-        "基线使用逐小块 shared scale 归约与枚举编码；优化版使用多组 warp 归约和快速编码。两者共用全局两级归约与显存；不是原始 CLI 的完整实现对比。",
+        "内部对照使用 shared scale 归约与枚举编码；MXFP8 默认使用 scale/直接编码融合 kernel，NVFP4 默认保留分组归约和快速编码。不是原始 CLI 的完整实现对比。",
         "中位数采用偶数样本中间两值均值，P95 使用 nearest-rank。CPU 仅测试 1M，预热一次后计时三次。",
         "",
         "| 格式 | 操作 | 范围 | 元素数 | median ms | P95 ms | 逻辑 GB/s |",

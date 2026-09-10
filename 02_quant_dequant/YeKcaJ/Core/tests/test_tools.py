@@ -86,7 +86,7 @@ class ToolTests(unittest.TestCase):
 
                 def fake_run(command, **kwargs):
                     calls.append(command)
-                    text = "pipeline::quantize_kernel" if valid else "SKIPPED"
+                    text = "pipeline::quantize_kernel pipeline::mxfp8_quantize_fused_kernel" if valid else "SKIPPED"
                     return subprocess.CompletedProcess(command, 0, text, "")
 
                 output = Path(folder) / "profile"

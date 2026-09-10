@@ -225,6 +225,13 @@ void check_encoder() {
   std::uniform_real_distribution<float> dist(-600, 600);
   for (unsigned i = 0; i < 10000; ++i)
     values.push_back(dist(rng));
+  // 随机 FP32 位模式覆盖极小数、大指数和正负号，不只测试普通正态数。
+  for (unsigned i = 0; !nvfp4 && i < 100000; ++i) {
+    const std::uint32_t bits = rng();
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    if (std::isfinite(value)) values.push_back(value);
+  }
   DeviceBuffer<float> input(values.size());
   DeviceBuffer<std::uint8_t> result(values.size());
   CUDA_CHECK(cudaMemcpy(input.ptr, values.data(), values.size() * 4, cudaMemcpyHostToDevice));
@@ -324,6 +331,27 @@ void self_test(const std::string& cpu_dir) {
     ++checked;
   }
   check_encoder();
+  if (!nvfp4) {
+    // 相邻 warp 使用跨度很大的 scale，检查融合广播、次正规数与饱和边界。
+    Tensor t{1, 0, 4, {}};
+    for (int exponent = -149; exponent <= 119; ++exponent) {
+      for (unsigned lane = 0; lane < 32; ++lane) {
+        const float value = std::ldexp(lane == 0 ? 448.0f : (lane - 16.0f), exponent);
+        t.values.push_back(value);
+      }
+    }
+    t.values.push_back(-0.0f);
+    t.cols = t.values.size();
+    Options o;
+    Workspace w(t.values.size(), o);
+    w.upload(t.values);
+    w.events.measure([&] { w.launch_quant(); });
+    const auto fused = w.download(t);
+    compare_packed(fused, reference_quantize(t, o));
+    w.events.measure([&] { w.launch_quant(true); });
+    compare_packed(fused, w.download(t));
+    std::cout << "mxfp8_fused_scale_cases=270 status=PASS\n";
+  }
   std::cout << "pipeline_cases=" << checked << " status=PASS\n";
 }
 }  // namespace pipeline

@@ -79,7 +79,7 @@ nsys stats --report cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum \
 
 也可用 `python3 Core/tools/profile.py --directory records/my-profile` 串行采集两种格式。
 
-NVFP4 更换可执行路径和报告名。`quantize_kernel<true>` 为枚举基线，`<false>` 为优化编码。
+NVFP4 更换可执行路径和报告名。`quantize_kernel<true>` 为内部枚举对照；MXFP8 block+nearest 默认看 `mxfp8_quantize_fused_kernel`，NVFP4 默认看 `quantize_kernel<false>` 及其 scale/归约阶段。
 nsys 包含预热及端到端分支，不用于发布无 profiler 的最终性能数字。新版驱动配新版 nsys；
 本机 2024.6 曾缺失 kernel 数据，2026.1.3 已成功采集。Windows 查看器应同版或更新。
 

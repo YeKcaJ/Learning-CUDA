@@ -39,9 +39,33 @@ __device__ inline float magnitude(unsigned code, bool four) {
   return four ? magnitude2(code) : decode_e4m3(code);
 }
 
-// four=true 编码 E2M1，否则编码 E4M3；stochastic 控制随机舍入。
-// baseline 只选择内部对照编码算法，不表示运行旧版量化 kernel。
-// 正幅值编码单调，二分只需约 7 次查找，替代 E4M3 的 256 项枚举。
+// MXFP8 nearest 直接截取指数/尾数；中点严格向较小幅值舍入，不是 nearest-even。
+__device__ inline std::uint8_t encode_mxfp8_nearest(float value) {
+  const float x = fminf(fabsf(value), 448.0f);
+  const unsigned sign = __float_as_uint(value) >> 24 & 0x80u;
+  if (x <= 0x1p-10f) return 0;
+  if (x >= 448.0f) return 126u | sign;
+
+  const unsigned bits = __float_as_uint(x);
+  const unsigned exponent = bits >> 23;
+  const unsigned mantissa = bits & 0x7fffffu;
+  unsigned code;
+  if (exponent < 121) {
+    // E4M3 subnormal 间距固定为 2^-9；此处分支的 shift 范围为 21..24。
+    const unsigned significand = mantissa | 0x800000u;
+    const unsigned shift = 141 - exponent;
+    code = (significand >> shift) +
+           ((significand & ((1u << shift) - 1)) > (1u << (shift - 1)));
+  } else {
+    // FP32 保留最高 3 位尾数；舍入进位自然进入下一指数区间。
+    code = ((exponent - 120) << 3) + (mantissa >> 20) +
+           ((mantissa & 0xfffffu) > 0x80000u);
+  }
+  return code | sign;
+}
+
+// four=true 编码 E2M1，否则 E4M3；baseline 保留枚举，MXFP8 nearest 用直接编码。
+// 随机舍入与 NVFP4 的 E4M3 scale 仍使用原来的二分路径。
 __device__ inline std::uint8_t encode(float value, bool four, bool stochastic,
                                     std::uint32_t seed, std::size_t index,
                                     bool baseline = false) {
@@ -51,6 +75,8 @@ __device__ inline std::uint8_t encode(float value, bool four, bool stochastic,
 #endif
     return encode_e4m3(value);
   }
+
+  if (!nvfp4 && !four && !stochastic) return encode_mxfp8_nearest(value);
 
   const unsigned last = four ? 7 : 126;
   const unsigned sign = signbit(value) ? (four ? 8 : 128) : 0;
@@ -221,6 +247,30 @@ __global__ void build_block_scales(const float* input, const float* state,
     scales[i / kBlockSize] = scale_code(v, nvfp4 ? state[1] : 1.0f);
 }
 
+// MXFP8 block+nearest 融合 kernel：一个 warp 处理 32 元素，输入只读取一次。
+// 尾部补零并参与所有 shuffle；组首计算 scale 后广播，复用寄存器中的原值编码。
+// scale 公式及 FP32 除法保持原样，不引入 fast-math 或倒数近似。
+__global__ void mxfp8_quantize_fused_kernel(const float* input, std::uint8_t* data,
+                                          std::uint8_t* scales, std::size_t n) {
+  const std::size_t i = blockIdx.x * 256ull + threadIdx.x;
+  const unsigned lane = threadIdx.x & 31;
+  const float value = i < n ? input[i] : 0.0f;
+  float maximum = fabsf(value);
+  for (unsigned step = 16; step; step >>= 1)
+    maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, step));
+
+  unsigned code = 127;
+  if (lane == 0 && i < n) {
+    code = scale_code(maximum, 1.0f);
+    scales[i / 32] = code;
+  }
+  code = __shfl_sync(0xffffffffu, code, 0);
+  if (i < n) {
+    const float scale = scalbnf(1.0f, static_cast<int>(code) - 127);
+    data[i] = encode_mxfp8_nearest(value / scale);
+  }
+}
+
 // Kernel 5：用已计算的 scale 将 FP32 输入量化，输出低精度 data 字节。
 // 固定 256 线程/块：MXFP8 每线程写一个 E4M3 元素；NVFP4 每线程写两个 E2M1 元素。
 // NVFP4 偶数元素放低 4 位、奇数元素放高 4 位，避免多个线程竞争同一个字节。
@@ -301,6 +351,12 @@ struct Workspace {
   // 同一默认 stream 按顺序执行，阶段之间不需要把 scale 拷回 CPU。
   void launch_quant(bool baseline = false) {
     if (!n) return;
+
+    if (!nvfp4 && !options.tensor && !options.stochastic && !baseline) {
+      mxfp8_quantize_fused_kernel<<<static_cast<unsigned>(ceil_div(n, 256)), 256>>>(
+          input.ptr, data.ptr, scales.ptr, n);
+      return;
+    }
 
     // MXFP8 block 模式只需局部最大值，跳过全张量归约。
     if (nvfp4 || options.tensor) {

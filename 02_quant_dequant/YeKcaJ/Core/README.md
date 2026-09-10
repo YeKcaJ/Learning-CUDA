@@ -82,7 +82,8 @@ Core/tools/quantize.py run
 默认 block 模式的 GPU 路径：
 
 ```text
-MXFP8：build_block_scales -> quantize_kernel<false>
+MXFP8 nearest：mxfp8_quantize_fused_kernel（scale + 编码）
+MXFP8 stochastic：build_block_scales -> quantize_kernel<false>（原路径）
 NVFP4：maximum -> finalize_max -> build_block_scales -> quantize_kernel<false>
 反量化：dequantize_kernel<T>
 ```
@@ -102,7 +103,7 @@ NVFP4：maximum -> finalize_max -> build_block_scales -> quantize_kernel<false>
 | `benchmark(n,repeats)` | 固定 seed=20260909 的 FP32 正态输入；交替测内部枚举路径和默认路径，校验一致后测三种反量化输出。另测含分配/传输/释放的 host_api；仅 1M 规模额外测 CPU 三次。 |
 | `encoder_probe`（自测 kernel） | 每线程编码一个指定数值，输出未打包的编码字节；跳过 scale 计算，独立验证编码器。 |
 | `check_encoder()` | 检查正负零、相邻编码中点及两侧、随机数；比较 CPU/GPU 编码，并检查随机舍入约 1/2 的中点分布及种子变化。 |
-| `self_test(cpu_dir)` | 覆盖 0～65、255/256/257、1023/1024/1025 长度，两种 scale/舍入及三种输出；检查重复执行、冻结 CPU 输入和极端有限值。一次输出 299 个 pipeline case，另有编码器检查。 |
+| `self_test(cpu_dir)` | 覆盖 0～65、255/256/257、1023/1024/1025 长度，两种 scale/舍入及三种输出；检查重复执行、冻结 CPU 输入和极端有限值。299个pipeline case之外，MXFP8还检查随机FP32编码及270组跨scale融合结果。 |
 | `main(argc,argv)` | 分发 benchmark、自测、独立反量化或普通完整流程；校验参数和输入输出路径，捕获异常后输出 `pipeline=FAIL` 并返回非零。 |
 
 ## 4. pipeline.cuh：核心计算
@@ -114,20 +115,22 @@ NVFP4：maximum -> finalize_max -> build_block_scales -> quantize_kernel<false>
 | `random_unit(seed,index)` | 对 seed 和元素下标做固定整数混合，生成 (0,1) 内随机数；不依赖线程调度，CPU/GPU 可重现。 |
 | `magnitude2(code)` | 查 E2M1 的 8 个非负幅值：0、0.5、1、1.5、2、3、4、6。调用方负责符号。 |
 | `magnitude(code,four)` | 根据 four 选择 E2M1 幅值或 E4M3 解码值，供邻值查找使用。 |
-| `encode(value,four,stochastic,seed,index,baseline)` | 将已除以 scale 的数值编码；默认 E4M3 二分查邻值，E2M1 nearest 用固定中点比较；随机舍入按距离概率选择相邻值。baseline 的 nearest 使用枚举辅助函数。 |
+| `encode_mxfp8_nearest(value)` | 从 FP32 指数/尾数直接计算 E4M3 编码，余数严格超过中点才进位，单独处理 subnormal、零和饱和；不改变冻结舍入规则。 |
+| `encode(value,four,stochastic,seed,index,baseline)` | MXFP8 nearest 使用直接编码；随机舍入和 NVFP4 E4M3 scale 保留二分，E2M1 nearest 保留中点比较；baseline 使用枚举。 |
 | `scale_code(m,global)` | 根据组最大绝对值 m 编码 scale：MXFP8 为 E8M0，NVFP4 为 E4M3。处理全零和下溢。 |
 | `effective(scales,state,group)` | 解码实际乘数：MXFP8 为 `2^(scale字节-127)`；NVFP4 为 `state[1] * decode_e4m3(scales[group])`。 |
 
 MXFP8 默认每 32 元素一组，scale 指数字节为 `clamp(ceil(log2(m/448))+127,0,254)`；全零使用 127，正数比例下溢使用 0。NVFP4 每 16 元素一组，`global_scale=M/(6*448)`，再将 `m/(6*global_scale)` 编码成 E4M3 block scale；全零 global=1，正数下溢保留 FP32 最小正 subnormal。
 
-### 4.2 六个正式 kernel
+### 4.2 正式 kernel
 
 | Kernel | 输入和输出 | 线程分工与用途 |
 |---|---|---|
 | `maximum` | FP32 input -> partial | 每块 256 线程，跨步扫描并共享内存归约，每块输出一个局部最大绝对值。NVFP4 和 tensor 模式需要它。 |
 | `finalize_max` | partial -> state[0/1] | 一个 256 线程块归约全局最大 M；state[0]=M，state[1]=global_scale。全局参数留在 GPU。 |
 | `build_scales` | input/state -> scales | 每块 32 线程处理一个量化分组；tensor 模式直接使用全局 M。用于 tensor 和内部对照路径。 |
-| `build_block_scales` | input/state -> scales | 默认 block 路径，每块 256 线程处理 8 个 MXFP8 组或 16 个 NVFP4 组；shuffle width=32/16 隔离分组，组首线程写 scale。尾部补零但仍参与 shuffle。 |
+| `build_block_scales` | input/state -> scales | NVFP4 与 MXFP8 stochastic 的 block 路径，每块 256 线程处理多个分组；shuffle width=32/16 隔离分组。 |
+| `mxfp8_quantize_fused_kernel` | input -> data/scales | MXFP8 block+nearest 默认路径，每块256线程、每warp32元素；读取一次输入并在寄存器保留，归约后由lane0计算scale并广播，直接编码写出。所有尾部线程仍参与shuffle。 |
 | `quantize_kernel<Baseline>` | input/scales/state -> data | 每块 256 线程。MXFP8 一线程写一个 E4M3 字节；NVFP4 一线程写一个 packed 字节，偶数元素在低 4 位、奇数在高 4 位。奇数尾部高 4 位清零；scale 非正时编码正零。 |
 | `dequantize_kernel<T>` | data/scales/state -> output | 每块 256 线程，每线程恢复一个元素；NVFP4 先提取对应 nibble。FP32 中间值乘有效 scale，最后转换到 FP32/FP16/BF16。 |
 
@@ -213,7 +216,7 @@ MXFP8 默认每 32 元素一组，scale 指数字节为 `clamp(ceil(log2(m/448))
 | `quantize.generate_automatic(rows,cols,dtype,distribution,seed)` | 按本地月日子目录分配输入编号，生成文件及参数 JSON 清单，返回输入路径。 |
 | `quantize.main()` | 分发 generate、run、evaluate；evaluate 生成 6 份输入并执行 144 个配置组合，写 summary.json。 |
 | `benchmark.main()` | 顺序执行两种格式的 1M/4M/16M benchmark，保存每次 stdout JSONL、汇总 JSON、环境/源码哈希和 RESULTS.md。内部 command 查询硬件/编译器信息。 |
-| `profile.main()` | 用 nsys 对两种格式的 4M、5 次重复 benchmark 采集，保存 rep/capture.log/stats.txt/version.txt；检查报告中确实存在 quantize_kernel。 |
+| `profile.main()` | 用 nsys 对两种格式的 4M、5 次重复 benchmark 采集；MXFP8 检查融合 kernel，NVFP4 检查 quantize_kernel，避免只有内部对照却误报采集成功。 |
 
 ## 8. 测试函数
 
@@ -294,7 +297,7 @@ python3 Core/tools/quantize.py run --config Core/configs/nvfp4.toml \
 ### 步骤 6：完整误差评估
 
 ```bash
-python3 Core/tools/quantize.py evaluate --directory records/core-evaluation-02
+python3 Core/tools/quantize.py evaluate --directory records/04-evaluation-01
 ```
 
 保存 144 组结果和 summary.json。看 cpu_quant_match / cpu_dequant_match 是否通过，再看 max_abs_error、mae、mse 和压缩率；不要把 CPU 一致性等同于量化无损。
@@ -302,7 +305,7 @@ python3 Core/tools/quantize.py evaluate --directory records/core-evaluation-02
 ### 步骤 7：记录正式性能 baseline
 
 ```bash
-python3 Core/tools/benchmark.py --directory records/core-baseline-01 --repeats 20
+python3 Core/tools/benchmark.py --directory records/01-before/benchmark --repeats 20
 ```
 
 查看 RESULTS.md 和 summary.json；环境和源码哈希在 environment.json。量化看 `quant_optimized + resident_gpu`，反量化看 `dequant_fp32/fp16/bf16 + resident_gpu`。保存中位数、P95、逻辑 GB/s；修改后换目录运行，再按相同格式/规模/类型/口径比较。
@@ -312,11 +315,11 @@ python3 Core/tools/benchmark.py --directory records/core-baseline-01 --repeats 2
 ### 步骤 8：用 nsys 定位耗时
 
 ```bash
-python3 Core/tools/profile.py --directory records/core-profile-01
+python3 Core/tools/profile.py --directory records/03-mxfp8-fused-scale/profile
 nsys stats --force-export=true --report cuda_gpu_kern_sum \
-  records/core-profile-01/mxfp8.nsys-rep
+  records/03-mxfp8-fused-scale/profile/mxfp8.nsys-rep
 nsys stats --force-export=true --report cuda_gpu_kern_gb_sum \
-  records/core-profile-01/nvfp4.nsys-rep
+  records/03-mxfp8-fused-scale/profile/nvfp4.nsys-rep
 ```
 
 打开 .nsys-rep 查看时间线，或看 *_stats.txt。报告包含预热、内部枚举路径和 host_api 循环，不能把所有实例总耗时当成一次量化时间。最终性能数字用不带 profiler 的步骤 7；nsys 本身不能证明某条指令或占用率就是瓶颈。
