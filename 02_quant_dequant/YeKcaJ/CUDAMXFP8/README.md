@@ -11,7 +11,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-项目固定使用 `sm_86`，对应 RTX 3060 Laptop GPU。
+项目默认使用 `sm_75`，可用 `-DCMAKE_CUDA_ARCHITECTURES=86` 覆盖；本机在 RTX 3060 Laptop 上验证。
 
 ## 反量化
 
@@ -61,5 +61,33 @@ memory 中归约 `max(abs(x))`，再计算 E8M0 scale，最后由每个线程编
 
 固定测试输出保存在 `tests/results/`，不覆盖 CPU 的 `tests/golden/`。
 
-当前已完成 CUDA MXFP8 FP32 反量化和 FP32 到 MXFP8 量化；FP16/BF16 输出、NVFP4
-以及进一步性能优化将在后续里程碑实现。
+本页描述旧版 v1 CLI。新增 FP16 输入、配置与缩放模式、优化编码和设备驻留性能测试
+位于 `pipeline` 入口，见 [项目 README](../README.md) 和 [最终报告](../FINAL_REPORT.md)。
+
+## FP16 / BF16 输出
+
+在反量化命令末尾追加 `--output-dtype fp16` 或 `--output-dtype bf16`。默认保持 FP32。
+例如从本目录执行：
+
+```bash
+./build/cuda_mxfp8 \
+  ../CPUMXFP8/tests/golden/outlier_tail.mxfp8 \
+  ../CPUMXFP8/tests/golden/outlier_tail.dequant.fp32 \
+  build/tests/results/outlier_tail.cuda.dequant.fp16 --output-dtype fp16
+```
+
+kernel 先按 reference 的 FP32 运算顺序计算，再以 nearest-even 转换为目标类型，
+直接写入 16 位显存数组。文件头区分 `FP16DEQ1` 和 `BF16DEQ1`，payload 每元素 2 字节。
+验证用 CPU FP32 golden 转换后的目标类型逐位比较；不是要求 FP16 与原 FP32 零误差。
+
+## 回归测试
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+包含 27 个 CTest 项：量化、完整文件字节比较、三种反量化命令行输出，以及边界回归。
+边界回归覆盖 139 组生成输入、800 个编码舍入样本和独立的 16 位转换检查。
+自动测试文件放在 `build/tests/results/`。
+
+统一测试、内存检查和输出文件格式说明见 [CUDACommon/README.md](../CUDACommon/README.md)。

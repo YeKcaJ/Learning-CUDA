@@ -1,0 +1,12 @@
+{
+  "input": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/input/fp16/910/1.fp16",
+  "dtype": "fp16",
+  "rows": 128,
+  "cols": 129,
+  "distribution": null,
+  "seed": null,
+  "input_sha256": "5788f7166065da189d7d018d3d6889c3633c49fa80c3a0a97fbf4d8e16bba55a",
+  "migrated_on": "2026-09-10",
+  "original_path": "results/input.fp16",
+  "note": "迁移已有输入，未重新生成；原生成分布和种子未知。"
+}

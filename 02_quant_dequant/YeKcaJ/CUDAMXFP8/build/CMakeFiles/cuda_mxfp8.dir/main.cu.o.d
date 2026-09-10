@@ -189,6 +189,15 @@ CMakeFiles/cuda_mxfp8.dir/main.cu.o : /home/jky/Learning-CUDA-project/02_quant_d
     /usr/include/c++/12/utility \
     /usr/include/c++/12/bits/stl_relops.h \
     /usr/include/c++/12/initializer_list \
+    /home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/CUDAMXFP8/../CUDACommon/output.cuh \
+    /home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/CUDAMXFP8/../CUDACommon/../Core/output.cuh \
+    /usr/include/cuda_fp16.h \
+    /usr/include/cuda_fp16.hpp \
+    /usr/include/nv/target \
+    /usr/include/nv/detail/__target_macros \
+    /usr/include/nv/detail/__preprocessor \
+    /usr/include/cuda_bf16.h \
+    /usr/include/cuda_bf16.hpp \
     /usr/include/c++/12/algorithm \
     /usr/include/c++/12/bits/stl_algo.h \
     /usr/include/c++/12/bits/algorithmfwd.h \
@@ -204,6 +213,7 @@ CMakeFiles/cuda_mxfp8.dir/main.cu.o : /home/jky/Learning-CUDA-project/02_quant_d
     /usr/include/x86_64-linux-gnu/bits/wchar.h \
     /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
     /usr/include/x86_64-linux-gnu/bits/stdint-least.h \
+    /usr/include/c++/12/cstring \
     /usr/include/c++/12/fstream \
     /usr/include/c++/12/istream \
     /usr/include/c++/12/ios \
@@ -297,6 +307,12 @@ CMakeFiles/cuda_mxfp8.dir/main.cu.o : /home/jky/Learning-CUDA-project/02_quant_d
     /usr/include/x86_64-linux-gnu/c++/12/bits/basic_file.h \
     /usr/include/x86_64-linux-gnu/c++/12/bits/c++io.h \
     /usr/include/c++/12/bits/fstream.tcc \
+    /usr/include/c++/12/iostream \
+    /usr/include/c++/12/vector \
+    /usr/include/c++/12/bits/stl_uninitialized.h \
+    /usr/include/c++/12/bits/stl_vector.h \
+    /usr/include/c++/12/bits/stl_bvector.h \
+    /usr/include/c++/12/bits/vector.tcc \
     /usr/include/c++/12/iomanip \
     /usr/include/c++/12/locale \
     /usr/include/c++/12/bits/locale_facets_nonio.h \
@@ -308,10 +324,4 @@ CMakeFiles/cuda_mxfp8.dir/main.cu.o : /home/jky/Learning-CUDA-project/02_quant_d
     /usr/include/c++/12/bits/locale_conv.h \
     /usr/include/c++/12/bits/quoted_string.h \
     /usr/include/c++/12/sstream \
-    /usr/include/c++/12/bits/sstream.tcc \
-    /usr/include/c++/12/iostream \
-    /usr/include/c++/12/vector \
-    /usr/include/c++/12/bits/stl_uninitialized.h \
-    /usr/include/c++/12/bits/stl_vector.h \
-    /usr/include/c++/12/bits/stl_bvector.h \
-    /usr/include/c++/12/bits/vector.tcc
+    /usr/include/c++/12/bits/sstream.tcc

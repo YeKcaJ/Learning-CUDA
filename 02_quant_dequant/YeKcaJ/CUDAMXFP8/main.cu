@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include "../CUDACommon/output.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -14,7 +15,6 @@
 namespace {
 
 constexpr std::size_t kBlockSize = 32;
-constexpr float kTolerance = 1e-6f;
 
 // 统一检查 CUDA API，出错时给出可定位的异常信息。
 void check_cuda(cudaError_t status, const char* expression, const char* file,
@@ -27,6 +27,7 @@ void check_cuda(cudaError_t status, const char* expression, const char* file,
 
 #define CUDA_CHECK(expression) check_cuda((expression), #expression, __FILE__, __LINE__)
 
+// 主机端量化结果：每元素一个 E4M3 字节，每 32 个元素一个 E8M0 scale 字节。
 struct QuantizedFile {
   std::size_t rows = 0;
   std::size_t cols = 0;
@@ -137,21 +138,6 @@ void write_quantized(const std::string& path, const QuantizedFile& q) {
   if (!file) throw std::runtime_error("failed writing CUDA quantized output: " + path);
 }
 
-// 将 CUDA 结果保存为与 CPU golden 相同的 FP32DEQ1 格式。
-void write_dequant(const std::string& path, std::size_t rows, std::size_t cols,
-                   const std::vector<float>& values) {
-  std::ofstream file(path, std::ios::binary);
-  if (!file) throw std::runtime_error("cannot open CUDA output: " + path);
-  const std::uint32_t version = 1;
-  const std::uint64_t row_count = rows, col_count = cols, count = values.size();
-  file.write("FP32DEQ1", 8);
-  file.write(reinterpret_cast<const char*>(&version), sizeof(version));
-  file.write(reinterpret_cast<const char*>(&row_count), sizeof(row_count));
-  file.write(reinterpret_cast<const char*>(&col_count), sizeof(col_count));
-  file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-  file.write(reinterpret_cast<const char*>(values.data()),
-             static_cast<std::streamsize>(values.size() * sizeof(float)));
-}
 
 // E4M3FN 解码公式必须与 CPU reference 完全一致。
 __device__ float decode_e4m3(std::uint8_t code) {
@@ -164,6 +150,7 @@ __device__ float decode_e4m3(std::uint8_t code) {
 }
 
 // 枚举全部有限 E4M3 编码，采用与 CPU reference 相同的“误差更小才更新”规则。
+// 等距时保留先枚举的编码，不是 FP16/BF16 输出转换使用的 nearest-even。
 __device__ std::uint8_t encode_e4m3(float value) {
   if (isnan(value) || value == 0.0f) return 0;
   const float clipped = fminf(fmaxf(value, -448.0f), 448.0f);
@@ -183,26 +170,30 @@ __device__ std::uint8_t encode_e4m3(float value) {
 }
 
 // 每个线程负责一个元素，scale 由元素所属的 32 元素 block 决定。
+template <typename T>
 __global__ void mxfp8_dequant_kernel(const std::uint8_t* data,
-                                     const std::uint8_t* scales, float* output,
+                                     const std::uint8_t* scales, T* output,
                                      std::size_t count) {
   const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= count) return;
   const std::size_t block = index / kBlockSize;
   const int exponent = static_cast<int>(scales[block]);
   const float scale = scalbnf(1.0f, exponent - 127);
-  output[index] = decode_e4m3(data[index]) * scale;
+  // 中间值按 FP32 计算，最后一次转换直接写入目标类型显存，不额外启动转换 kernel。
+  output[index] = cuda_output::Format<T>::convert(decode_e4m3(data[index]) * scale);
 }
 
 // 在 GPU 上执行反量化，并使用 CUDA event 统计 kernel-only 时间。
-std::vector<float> dequantize_cuda(const QuantizedFile& input, float& kernel_ms) {
+template <typename T = float>
+std::vector<T> dequantize_cuda(const QuantizedFile& input, float& kernel_ms) {
   const std::size_t count = input.data.size();
+  if (count == 0) { kernel_ms = 0.0f; return {}; }
   std::uint8_t* device_data = nullptr;
   std::uint8_t* device_scales = nullptr;
-  float* device_output = nullptr;
+  T* device_output = nullptr;
   CUDA_CHECK(cudaMalloc(&device_data, input.data.size() * sizeof(std::uint8_t)));
   CUDA_CHECK(cudaMalloc(&device_scales, input.scales.size() * sizeof(std::uint8_t)));
-  CUDA_CHECK(cudaMalloc(&device_output, count * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&device_output, count * sizeof(T)));
   try {
     CUDA_CHECK(cudaMemcpy(device_data, input.data.data(), input.data.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_scales, input.scales.data(), input.scales.size(), cudaMemcpyHostToDevice));
@@ -219,8 +210,8 @@ std::vector<float> dequantize_cuda(const QuantizedFile& input, float& kernel_ms)
     CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start, stop));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    std::vector<float> output(count);
-    CUDA_CHECK(cudaMemcpy(output.data(), device_output, count * sizeof(float), cudaMemcpyDeviceToHost));
+    std::vector<T> output(count);
+    CUDA_CHECK(cudaMemcpy(output.data(), device_output, count * sizeof(T), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(device_data));
     CUDA_CHECK(cudaFree(device_scales));
     CUDA_CHECK(cudaFree(device_output));
@@ -240,6 +231,7 @@ __global__ void mxfp8_quant_kernel(const float* input, std::uint8_t* data,
   const std::size_t lane = threadIdx.x;
   const std::size_t block = static_cast<std::size_t>(blockIdx.x);
   const std::size_t index = block * kBlockSize + lane;
+  // 尾部无效线程用零参与最大值归约，不能提前退出，否则会破坏后续块同步。
   const float value = index < count ? input[index] : 0.0f;
   abs_values[lane] = fabsf(value);
   __syncthreads();
@@ -250,6 +242,7 @@ __global__ void mxfp8_quant_kernel(const float* input, std::uint8_t* data,
     __syncthreads();
   }
 
+  // 仅线程 0 写共享 scale；同步后所有有效线程再用该 scale 编码。
   if (lane == 0) {
     const float max_abs = abs_values[0];
     int exponent = 127;
@@ -334,28 +327,24 @@ void compare_quantized(const QuantizedFile& actual, const QuantizedFile& expecte
     throw std::runtime_error("CUDA/CPU quantized byte comparison failed");
 }
 
-// 统计 CUDA 输出与 CPU golden 的最大差异、MAE 和 MSE。
-void compare(const std::vector<float>& actual, const std::vector<float>& expected) {
-  if (actual.size() != expected.size()) throw std::runtime_error("output size mismatch");
-  double mae = 0.0, mse = 0.0;
-  float max_diff = 0.0f;
-  for (std::size_t i = 0; i < actual.size(); ++i) {
-    const float diff = std::fabs(actual[i] - expected[i]);
-    max_diff = std::max(max_diff, diff);
-    mae += diff;
-    mse += static_cast<double>(diff) * diff;
-  }
-  mae /= actual.size();
-  mse /= actual.size();
-  std::cout << std::setprecision(8) << "max_abs_diff=" << max_diff
-            << " mae=" << mae << " mse=" << mse << '\n';
-  if (max_diff > kTolerance) throw std::runtime_error("CUDA/CPU comparison failed");
+
+// CLI 反量化流程：调用 GPU 封装、比较 CPU golden、按 T 写出文件。
+template <typename T>
+void run_dequant(const QuantizedFile& input, const std::vector<float>& golden,
+                 const std::string& path) {
+  float kernel_ms = 0.0f;
+  const auto output = dequantize_cuda<T>(input, kernel_ms);
+  cuda_output::compare(output, golden);
+  cuda_output::write(path, input.rows, input.cols, output);
+  std::cout << "cuda_dequant=pass kernel_ms=" << kernel_ms
+            << " output_bytes=" << output.size() * sizeof(T) << " output=" << path << '\n';
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    const std::string dtype = cuda_output::parse_dtype(argc, argv);
     if (argc > 1 && std::string(argv[1]) == "--quantize") {
       if (argc < 4 || argc > 5) {
         std::cerr << "usage: " << argv[0]
@@ -375,29 +364,25 @@ int main(int argc, char** argv) {
                 << " \noutput=" << argv[3] << '\n';
       return 0;
     }
-    if (argc < 3) {
+    if (argc < 3 || argc > 4) {
       std::cerr << "usage: " << argv[0]
-                << " <cpu_quantized.mxfp8> <cpu_dequant.fp32> [cuda_output.fp32]\n"
+                << " <cpu_quantized.mxfp8> <cpu_dequant.fp32> [cuda_output] [--output-dtype fp32|fp16|bf16]\n"
                 << "   or: " << argv[0]
                 << " --quantize <input.fp32> <cuda_output.mxfp8> [cpu_golden.mxfp8]\n";
       return 2;
     }
     const std::string quantized_path = argv[1];
     const std::string golden_path = argv[2];
-    const std::string output_path = argc > 3 ? argv[3] : "cuda_dequant.fp32";
+    const std::string output_path = argc > 3 ? argv[3] : "cuda_dequant." + dtype;
     const QuantizedFile quantized = read_quantized(quantized_path);
     std::size_t golden_rows = 0, golden_cols = 0;
     const auto golden = read_dequant(golden_path, golden_rows, golden_cols);
     if (golden_rows != quantized.rows || golden_cols != quantized.cols)
       throw std::runtime_error("CPU golden shape does not match quantized input");
-    float kernel_ms = 0.0f;
-    const auto output = dequantize_cuda(quantized, kernel_ms);
-    compare(output, golden);
-    write_dequant(output_path, quantized.rows, quantized.cols, output);
-    const double bytes = static_cast<double>(quantized.data.size() + quantized.scales.size());
-    const double bandwidth = kernel_ms > 0.0f ? bytes / (kernel_ms * 1e6) : 0.0;
-    std::cout << "cuda_dequant=pass kernel_ms=" << kernel_ms
-              << " \neffective_bandwidth_GBps=" << bandwidth << " \noutput=" << output_path << '\n';
+    // 运行时字符串选择编译期模板实例，三种输出共用同一套反量化公式。
+    if (dtype == "fp16") run_dequant<__half>(quantized, golden, output_path);
+    else if (dtype == "bf16") run_dequant<__nv_bfloat16>(quantized, golden, output_path);
+    else run_dequant<float>(quantized, golden, output_path);
   } catch (const std::exception& error) {
     std::cerr << "error: " << error.what() << '\n';
     return 1;

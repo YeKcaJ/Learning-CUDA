@@ -30,6 +30,7 @@ float decode_e4m3(std::uint8_t code) {
 }
 
 // 参考实现直接枚举候选编码，保证舍入规则清晰且便于 CUDA 对照。
+// 等距时保留先枚举的编码，不是 nearest-even；NaN 和正负零在此编码为正零。
 std::uint8_t encode_e4m3(float value) {
   if (std::isnan(value) || value == 0.0f) return 0;
   const float clipped = std::clamp(value, -kFp8Max, kFp8Max);
@@ -54,6 +55,7 @@ struct Quantized {
   std::vector<std::uint8_t> scales;  // 每个 32 元素 block 一个 E8M0 指数。
 };
 
+// 按行主序展开后每 32 个元素分组，量化 block 可以跨越矩阵行边界。
 Quantized quantize(const std::vector<float>& input, std::size_t rows,
                   std::size_t cols) {
   assert(input.size() == rows * cols);
@@ -81,6 +83,7 @@ Quantized quantize(const std::vector<float>& input, std::size_t rows,
   return out;
 }
 
+// E8M0 字节保存带 127 偏置的指数，恢复为 2^(code-127) 后乘解码值。
 std::vector<float> dequantize(const Quantized& q) {
   std::vector<float> output(q.rows * q.cols);
   for (std::size_t block = 0; block < q.scales.size(); ++block) {
@@ -93,7 +96,7 @@ std::vector<float> dequantize(const Quantized& q) {
   return output;
 }
 
-// 文件布局：magic、矩阵尺寸、block size、数据字节数、scale 字节数、data、scales。
+// 文件布局：magic、版本号、矩阵尺寸、block size、区段长度、data、scales。
 void write_binary(const std::string& path, const Quantized& q) {
   std::ofstream file(path, std::ios::binary);
   if (!file) throw std::runtime_error("cannot open output: " + path);
@@ -217,6 +220,7 @@ std::vector<float> read_dequant(const std::string& path, std::size_t& rows,
 }
 
 // 生成固定测试集，写出输入/golden，并回读执行字节级和元素级校验。
+// freeze 写入固定输入和 golden；verify 只读取它们进行比较并写验证报告。
 void run_reference_suite(bool regenerate) {
   namespace fs = std::filesystem;
   fs::create_directories("tests/data");
@@ -227,6 +231,7 @@ void run_reference_suite(bool regenerate) {
   report << "format_version=1\nalgorithm=MXFP8_E4M3FN_E8M0_BLOCK32\n"
          << "mode=" << (regenerate ? "freeze" : "verify") << "\n";
   struct TestCase { std::string name; std::size_t rows; std::size_t cols; std::vector<float> values; };
+  // 固定种子和矩阵形状覆盖零值、正常值、离群值和尾部不足整块。
   std::vector<TestCase> cases;
   cases.push_back({"zeros", 2, 17, std::vector<float>(34, 0.0f)});
   std::vector<float> basic(32);
@@ -275,6 +280,7 @@ void run_reference_suite(bool regenerate) {
     for (std::size_t i = 0; i < dequantized.size(); ++i)
       max_diff = std::max(max_diff, std::fabs(dequantized[i] - loaded_dequantized[i]));
     if (max_diff > 1e-6f) throw std::runtime_error("dequant element comparison failed: " + test.name);
+    // 此处统计原始输入到反量化结果的损失，与前面的 golden 一致性误差不同。
     double mae = 0.0, mse = 0.0;
     float max_error = 0.0f;
     for (std::size_t i = 0; i < test.values.size(); ++i) {
@@ -329,6 +335,7 @@ void self_test() {
 
 }  // namespace
 
+// 无测试选项时生成指定尺寸的正态分布矩阵，保存量化文件并打印损失。
 int main(int argc, char** argv) {
   try {
     if (argc > 1 && std::string(argv[1]) == "--self-test") {

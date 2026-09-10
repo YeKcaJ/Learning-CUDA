@@ -33,6 +33,7 @@ float decode_e4m3(std::uint8_t code) {
 }
 
 // 枚举 E4M3 候选值，作为确定性的 nearest rounding 参考实现。
+// 等距时保留先枚举的编码，不是 nearest-even；NaN 和正负零在此编码为正零。
 std::uint8_t encode_e4m3(float value) {
   if (std::isnan(value) || value == 0.0f) return 0;
   const float clipped = std::clamp(value, -448.0f, 448.0f);
@@ -51,6 +52,7 @@ std::uint8_t encode_e4m3(float value) {
 }
 
 // 将归一化浮点数舍入到最接近的 E2M1 幅值，并把符号放到最高 bit。
+// 中点保留较小幅值；signbit 保留负零，区别于 E4M3 编码的零处理。
 std::uint8_t encode_e2m1(float value) {
   const bool negative = std::signbit(value);
   const float magnitude = std::fabs(value);
@@ -80,6 +82,7 @@ struct Quantized {
   std::vector<std::uint8_t> block_scales;
 };
 
+// 按行主序展开后每 16 个元素分组，使用全局 FP32 scale 和局部 E4M3 scale。
 Quantized quantize(const std::vector<float>& input, std::size_t rows,
                   std::size_t cols) {
   assert(input.size() == rows * cols);
@@ -105,6 +108,7 @@ Quantized quantize(const std::vector<float>& input, std::size_t rows,
                                        ? block_max / (kNvfp4Max * out.global_scale)
                                        : 0.0f;
     out.block_scales[block] = encode_e4m3(normalized_scale);
+    // 必须使用已舍入的 block scale 编码元素，才能与反量化使用同一有效 scale。
     const float effective_scale = out.global_scale * decode_e4m3(out.block_scales[block]);
     for (std::size_t i = begin; i < end; ++i) {
       const std::uint8_t nibble = effective_scale > 0.0f
@@ -121,6 +125,7 @@ Quantized quantize(const std::vector<float>& input, std::size_t rows,
   return out;
 }
 
+// 按元素下标取高/低 nibble，再乘 global_scale 与解码后的 block_scale。
 std::vector<float> dequantize(const Quantized& q) {
   std::vector<float> output(q.rows * q.cols);
   for (std::size_t i = 0; i < output.size(); ++i) {
@@ -134,7 +139,7 @@ std::vector<float> dequantize(const Quantized& q) {
   return output;
 }
 
-// 文件布局：magic、尺寸、block size、global scale、区段长度、packed data、block scales。
+// 文件布局：magic、版本号、尺寸、block size、global scale、区段长度、packed、scales。
 void write_binary(const std::string& path, const Quantized& q) {
   std::ofstream file(path, std::ios::binary);
   if (!file) throw std::runtime_error("cannot open output: " + path);
@@ -261,6 +266,7 @@ std::vector<float> read_dequant(const std::string& path, std::size_t& rows,
 }
 
 // 生成固定测试集，写出输入/golden，并回读执行字节级和元素级校验。
+// freeze 写入固定输入和 golden；verify 只读取它们进行比较并写验证报告。
 void run_reference_suite(bool regenerate) {
   namespace fs = std::filesystem;
   fs::create_directories("tests/data");
@@ -271,6 +277,7 @@ void run_reference_suite(bool regenerate) {
   report << "format_version=1\nalgorithm=NVFP4_E2M1_E4M3_BLOCK16\n"
          << "mode=" << (regenerate ? "freeze" : "verify") << "\n";
   struct TestCase { std::string name; std::size_t rows; std::size_t cols; std::vector<float> values; };
+  // 固定种子和矩阵形状覆盖零值、正常值、离群值和奇数长度的 packed 尾部。
   std::vector<TestCase> cases;
   cases.push_back({"zeros", 2, 9, std::vector<float>(18, 0.0f)});
   std::vector<float> basic(16);
@@ -319,6 +326,7 @@ void run_reference_suite(bool regenerate) {
     for (std::size_t i = 0; i < dequantized.size(); ++i)
       max_diff = std::max(max_diff, std::fabs(dequantized[i] - loaded_dequantized[i]));
     if (max_diff > 1e-6f) throw std::runtime_error("dequant element comparison failed: " + test.name);
+    // 此处统计原始输入到反量化结果的损失，与前面的 golden 一致性误差不同。
     double mae = 0.0, mse = 0.0;
     float max_error = 0.0f;
     for (std::size_t i = 0; i < test.values.size(); ++i) {
@@ -374,6 +382,7 @@ void self_test() {
 
 }  // namespace
 
+// 无测试选项时生成指定尺寸的正态分布矩阵，保存量化文件并打印损失。
 int main(int argc, char** argv) {
   try {
     if (argc > 1 && std::string(argv[1]) == "--self-test") {
