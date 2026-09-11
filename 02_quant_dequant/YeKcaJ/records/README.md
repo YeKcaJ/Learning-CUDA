@@ -11,11 +11,13 @@ records/
 │   └── source/                   优化前源码备份 + 编译选项
 ├── 02-mxfp8-direct-encode/       第 1 步：nearest 直接编码 E4M3
 │   └── benchmark/
-├── 03-mxfp8-fused-scale/         第 2 步：scale 归约+广播+编码融合（最终态）
+├── 03-mxfp8-fused-scale/         第 2 步：scale 归约+广播+编码融合
 │   ├── benchmark/
 │   ├── repeat/                   复测
 │   ├── profile/                  nsys 采集
 │   └── validation/               正确性测试 + sanitizer + 源码备份
+├── 04-nvfp4-e4m3-scale-fused/    第 3 步：NVFP4 scale 直接编码 + 归约融合（最终态）
+│   └── benchmark/
 └── _archive/                     归档，保留但不参与主线
     ├── 2026-09-09-legacy-cli/    旧版 CLI 时代的性能与 profile 记录
     ├── evaluation/               误差评估汇总
@@ -38,6 +40,29 @@ records/
 scale 融合  0.199680 -> 0.123312   1.62x
 合计        0.467968 -> 0.123312   3.79x
 ```
+
+## NVFP4 量化中位数（resident_gpu，预热 3 + 重复 20）
+
+| 元素数 | 优化前 `01-before` | 直接编码+融合 `04-nvfp4-e4m3-scale-fused` |
+|---|---:|---:|
+| 1M | 0.142336 | **0.063488** |
+| 4M | 0.450944 | **0.142336** |
+| 16M | 1.742800 | **0.519136** |
+
+两步改动的贡献（以 4M 为例）：
+
+```
+scale 直接编码  0.520704 -> 0.238592   2.18x
+归约+编码融合   0.238592 -> 0.142336   1.68x
+合计            0.450944 -> 0.142336   3.17x
+```
+
+注：`01-before` 的 NVFP4 数字（0.450944）与步骤 1 的起点（0.520704）来自不同
+采集批次，GPU 状态有别；加速比统一以 `01-before` 为基准计算。
+
+本轮**未能运行 Compute Sanitizer**：Deb 包自带 2022.4.1 版与驱动 596.08 不兼容
+（用最小 CUDA 程序验证为环境问题）。替代证据为 CPU oracle 逐字节比对与分组边界
+专项测试，详见 `../OPTIMIZATION_LOG.md` 第 2 次记录。
 
 ## 各目录对应关系（重组前 -> 重组后）
 
@@ -71,6 +96,10 @@ scale 融合  0.199680 -> 0.123312   1.62x
 |---|---|
 | 优化前 | `01-before/source/source.tar.gz` |
 | 优化后（最终态） | `03-mxfp8-fused-scale/validation/source-after.tar.gz` |
+
+NVFP4 优化（第 2 次）的源码即当前 `Core/`，其 SHA256 记录在
+`04-nvfp4-e4m3-scale-fused/benchmark/environment.json`；中间态"仅 scale 直接编码"
+同样没有独立源码备份。
 
 **中间态"仅直接编码"没有源码备份**，仅有 `02-mxfp8-direct-encode/benchmark/environment.json` 中的 SHA256。如需复现该中间态，需从优化后源码中移除 `mxfp8_quantize_fused_kernel` 并恢复 `launch_quant()` 的三段式路径。
 

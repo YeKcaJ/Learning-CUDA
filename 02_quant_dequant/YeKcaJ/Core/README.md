@@ -84,7 +84,7 @@ Core/tools/quantize.py run
 ```text
 MXFP8 nearest：mxfp8_quantize_fused_kernel（scale + 编码）
 MXFP8 stochastic：build_block_scales -> quantize_kernel<false>（原路径）
-NVFP4：maximum -> finalize_max -> build_block_scales -> quantize_kernel<false>
+NVFP4：maximum -> finalize_max -> nvfp4_quantize_fused_kernel（scale + 编码）
 反量化：dequantize_kernel<T>
 ```
 
@@ -115,9 +115,9 @@ NVFP4：maximum -> finalize_max -> build_block_scales -> quantize_kernel<false>
 | `random_unit(seed,index)` | 对 seed 和元素下标做固定整数混合，生成 (0,1) 内随机数；不依赖线程调度，CPU/GPU 可重现。 |
 | `magnitude2(code)` | 查 E2M1 的 8 个非负幅值：0、0.5、1、1.5、2、3、4、6。调用方负责符号。 |
 | `magnitude(code,four)` | 根据 four 选择 E2M1 幅值或 E4M3 解码值，供邻值查找使用。 |
-| `encode_mxfp8_nearest(value)` | 从 FP32 指数/尾数直接计算 E4M3 编码，余数严格超过中点才进位，单独处理 subnormal、零和饱和；不改变冻结舍入规则。 |
-| `encode(value,four,stochastic,seed,index,baseline)` | MXFP8 nearest 使用直接编码；随机舍入和 NVFP4 E4M3 scale 保留二分，E2M1 nearest 保留中点比较；baseline 使用枚举。 |
-| `scale_code(m,global)` | 根据组最大绝对值 m 编码 scale：MXFP8 为 E8M0，NVFP4 为 E4M3。处理全零和下溢。 |
+| `encode_e4m3_nearest(value)` | 从 FP32 指数/尾数直接计算 E4M3 编码，余数严格超过中点才进位，单独处理 subnormal、零和饱和；不改变冻结舍入规则。两种格式共用：MXFP8 的元素编码，以及 NVFP4 的 E4M3 block scale。 |
+| `encode(value,four,stochastic,seed,index,baseline)` | MXFP8 nearest 与 NVFP4 E4M3 block scale 使用直接编码；随机舍入保留二分，E2M1 nearest 保留中点比较；baseline 使用枚举。 |
+| `scale_code(m,global)` | 根据组最大绝对值 m 编码 scale：MXFP8 为 E8M0，NVFP4 为 E4M3（经 `encode_e4m3_nearest` 直接编码）。处理全零和下溢。 |
 | `effective(scales,state,group)` | 解码实际乘数：MXFP8 为 `2^(scale字节-127)`；NVFP4 为 `state[1] * decode_e4m3(scales[group])`。 |
 
 MXFP8 默认每 32 元素一组，scale 指数字节为 `clamp(ceil(log2(m/448))+127,0,254)`；全零使用 127，正数比例下溢使用 0。NVFP4 每 16 元素一组，`global_scale=M/(6*448)`，再将 `m/(6*global_scale)` 编码成 E4M3 block scale；全零 global=1，正数下溢保留 FP32 最小正 subnormal。
@@ -129,8 +129,9 @@ MXFP8 默认每 32 元素一组，scale 指数字节为 `clamp(ceil(log2(m/448))
 | `maximum` | FP32 input -> partial | 每块 256 线程，跨步扫描并共享内存归约，每块输出一个局部最大绝对值。NVFP4 和 tensor 模式需要它。 |
 | `finalize_max` | partial -> state[0/1] | 一个 256 线程块归约全局最大 M；state[0]=M，state[1]=global_scale。全局参数留在 GPU。 |
 | `build_scales` | input/state -> scales | 每块 32 线程处理一个量化分组；tensor 模式直接使用全局 M。用于 tensor 和内部对照路径。 |
-| `build_block_scales` | input/state -> scales | NVFP4 与 MXFP8 stochastic 的 block 路径，每块 256 线程处理多个分组；shuffle width=32/16 隔离分组。 |
+| `build_block_scales` | input/state -> scales | MXFP8 stochastic 与两条 baseline 对照路径；NVFP4 默认路径已改用下方融合 kernel。每块 256 线程处理多个分组，shuffle width=32/16 隔离分组。 |
 | `mxfp8_quantize_fused_kernel` | input -> data/scales | MXFP8 block+nearest 默认路径，每块256线程、每warp32元素；读取一次输入并在寄存器保留，归约后由lane0计算scale并广播，直接编码写出。所有尾部线程仍参与shuffle。 |
+| `nvfp4_quantize_fused_kernel` | input/state -> data/scales | NVFP4 block+nearest 默认路径，每块256线程、每线程2元素（1 packed字节）。组内用 `__shfl_down_sync(width=kBlockSize/2=8)` 归约最大值（8 lane = 16 元素 = 1 组），组首算 scale 后广播，复用寄存器原值编码并打包。输入只读一次，需先由 `maximum`/`finalize_max` 求出 global_scale。 |
 | `quantize_kernel<Baseline>` | input/scales/state -> data | 每块 256 线程。MXFP8 一线程写一个 E4M3 字节；NVFP4 一线程写一个 packed 字节，偶数元素在低 4 位、奇数在高 4 位。奇数尾部高 4 位清零；scale 非正时编码正零。 |
 | `dequantize_kernel<T>` | data/scales/state -> output | 每块 256 线程，每线程恢复一个元素；NVFP4 先提取对应 nibble。FP32 中间值乘有效 scale，最后转换到 FP32/FP16/BF16。 |
 

@@ -38,3 +38,106 @@ nsys：4M 默认路径由两个 kernel 合为 `mxfp8_quantize_fused_kernel`，�
 正确性：7/7测试通过，覆盖中点两侧、随机FP32位模式和跨scale分组；Compute Sanitizer memcheck/racecheck/synccheck均0错误。
 结论：保留；本轮仅提升量化，反量化未优化。
 数据：[分步](records/02-mxfp8-direct-encode/benchmark/RESULTS.md)、[融合](records/03-mxfp8-fused-scale/benchmark/RESULTS.md)、[复测](records/03-mxfp8-fused-scale/repeat/RESULTS.md)、[nsys](records/03-mxfp8-fused-scale/profile/mxfp8_stats.txt)。
+
+## 第 2 次：NVFP4 block scale 直接编码 + 归约融合（2026-09-11）
+
+定位：nsys 显示 NVFP4 默认路径中 `build_block_scales` 占 71%（0.409 ms），
+编码 `quantize_kernel` 仅 16%（0.092 ms）——瓶颈与 MXFP8 相反。该 kernel 读
+16 MB 按带宽约需 53 us，实测 409 us，慢 8.5 倍，故为计算受限：NVFP4 的
+block scale 也是 E4M3，却仍走 7 轮二分查找（每轮 `decode_e4m3` 内含 `scalbnf`）。
+
+改动（两步，分别计量以便归因）：
+1. **scale 直接编码**：`scale_code()` 的 NVFP4 分支改调用第 1 次已有的
+   `encode_e4m3_nearest()`（由 `encode_mxfp8_nearest` 改名，因两种格式共用）。
+   该函数与二分路径在中点判定上同为"严格大于中点才进位"，舍入规则不变。
+2. **归约与编码融合**：新增 `nvfp4_quantize_fused_kernel`，一个 warp 覆盖 4 个
+   分组，组内用 `__shfl_down_sync(width=kBlockSize/2=8)` 归约最大值（每 lane
+   打包 2 元素，故 8 lane = 16 元素 = 1 组），组首算出 scale 后广播，复用寄存器
+   中的原值编码并打包。`input` 由读 3 遍降为读 2 遍。
+   `maximum`/`finalize_max` 必须保留：`global_scale` 依赖全张量最大值，
+   是固有的两阶段全局归约，无法并入 per-block kernel。
+
+量化性能（同第 0 次条件，单位 ms，`resident_gpu` 中位数）：
+
+| 元素数 | 优化前 | 步骤1 后 | 步骤2 后 | P95 | 加速比 |
+|---|---:|---:|---:|---:|---:|
+| 1M | 0.142336 | 未单独测量 | **0.063488** | 0.064512 | 2.24x |
+| 4M | 0.450944 | 0.238592 | **0.142336** | 0.143360 | 3.17x |
+| 16M | 1.742800 | 未单独测量 | **0.519136** | 0.523264 | 3.36x |
+
+步骤 1 的归因仅在 4M 做了单独测量（单次运行）：0.520704 -> 0.238592 ms，2.18x。
+1M/16M 未在步骤 1 状态下单独采集，故不填数字；表中"步骤2 后"为
+`04-nvfp4-e4m3-scale-fused/benchmark/` 的正式结果。
+
+nsys 验证（4M，`--benchmark` 含预热与 baseline 对照，故实例数多于单次量化）：
+
+| kernel | 实例数 | 中位数 (ms) | 归属 |
+|---|---:|---:|---|
+| `build_scales` | 9 | 0.719 | baseline / tensor 路径 |
+| `maximum` | 26 | 0.062 | 所有路径的全局归约第一阶段 |
+| `finalize_max` | 26 | 0.003 | 同上第二阶段 |
+| `nvfp4_quantize_fused_kernel` | 17 | 0.094 | **默认 NVFP4 路径（新）** |
+| `quantize_kernel<(bool)1>` | 9 | 0.090 | baseline 枚举路径 |
+| `dequantize_kernel<*>` | 8 | 0.09-0.10 | 三种输出类型 |
+
+关键点：
+- **`build_block_scales` 与 `quantize_kernel<(bool)0>` 在本次采集里完全消失**
+  （各 0 次），默认路径已由单个 `nvfp4_quantize_fused_kernel` 取代，
+  其实例数 17 与默认路径调用次数一致。
+- NVFP4 的 baseline 对照路径用的是 `build_scales`（9 次），**不是**
+  `build_block_scales`；后者仅服务 MXFP8 stochastic 与 MXFP8 baseline。
+- `maximum`/`finalize_max` 各 26 次且成对出现，说明全局归约仍是每个量化
+  调用一次，未被融合消除（`global_scale` 依赖全张量最大值，属固有前置）。
+
+正确性：
+- ctest 7/7 通过（含 `--self-test` 与 CPU oracle 逐字节比对）。
+- `--self-test`：`pipeline_cases=299 PASS`，`encoder_samples=10046` 且随机舍入
+  比例 0.4936（合格区间内）；三种输出类型 `element_mismatches=0`、`max_abs_diff=0`。
+- **专项分组边界测试 15/15 通过**：针对融合 kernel 的 `width=8` 分组，构造组基准
+  逐组放大且组内递增的输入，覆盖 16/17/31/32/33/48/255/256/257/512/1000/4096/
+  8191/8192/8199 等规模，由内部 `compare_packed` 与 CPU oracle 全字段比对。
+  若 shuffle width 或组首判断写错导致跨组串用 scale，此测试必然失败。
+- **边界值测试 16/16 通过**（两种格式各一次）：在 `--self-test` 已覆盖的
+  冻结样例（basic/outlier_tail/random/tail_block/zeros，共 5 份，文件均完整）
+  之外，另用 `edge_value_test.py` 针对本次改动的 scale 编码器补做边界验证：
+  全零、负零、奇数长度全零、±FLT_MAX、最小正 subnormal、次正规混合、
+  ±1e-38、±1e38、每组仅首/末元素有效、跨组幅值递增/递减、零与最大值交替，
+  共 16 例，均由内部 `compare_packed` 与 CPU oracle 逐字节比对。
+- 未回归 MXFP8：复用 `scale_code()` 使两条路径共享代码，实测 1M 0.034816、
+  4M 0.123632、16M 复测 0.435664/0.434096/0.435664 ms，与第 1 次的
+  0.034816/0.123312/0.435648 一致（记录中 16M 曾出现 0.477184，复测 4 次
+  确认为冷启动噪声，非回退）。
+- 反量化未改动：4M 为 fp32 0.088064、fp16 0.079200、bf16 0.086896 ms。
+
+**关于 baseline 参照的说明（重要）**：`scale_code()` 被默认路径、baseline
+对照路径和 tensor 模式共用，因此本轮的 scale 改动让 `quant_enumeration`（baseline）
+也一并变快，实测（`resident_gpu` 中位数，ms）：
+
+| 元素数 | `01-before` | 本轮后 | 
+|---|---:|---:|
+| 1M | 0.316416 | 0.210944 |
+| 4M | 1.144832 | 0.726528 |
+| 16M | 4.514304 | 2.827792 |
+
+这意味着：
+
+- `quant_enumeration` **不再是纯粹的"优化前"参照**——它只保留枚举式元素编码，
+  scale 计算已是优化后的实现。
+- 因此本轮的加速比一律以 `records/01-before` 为基准，而非同批次的
+  `quant_enumeration`。`01-before/benchmark/environment.json` 中的 SHA256 可佐证
+  它采集于任何改动之前。
+- 两条路径的输出仍与 CPU oracle 逐字节一致（`compare_packed` 在每次
+  `--benchmark` 内部校验），故 baseline 作为正确性对照依然有效。
+
+**验证边界（重要）**：本轮**未能**运行 Compute Sanitizer。Deb 包
+`nvidia-cuda-toolkit` 自带的是 2022.4.1 版，与当前驱动 596.08 不兼容：
+默认报 `Unable to find injection library libsanitizer-collection.so`，
+加 `--injection-path /usr/lib/nvidia-cuda-toolkit/compute-sanitizer` 后报
+`Target application terminated before first instrumented API call`。
+用最小 CUDA 程序验证，失败可复现，确认为环境问题而非本项目代码问题。
+第 1 次的 memcheck/racecheck/synccheck 记录（`0 errors`/`0 hazards`）产生于
+2026-09-10 环境仍可用时，其证据保留在 `03-mxfp8-fused-scale/validation/`。
+本轮以 CPU oracle 逐字节比对 + 分组边界专项测试作为替代证据。
+
+结论：保留；NVFP4 量化提升 2.24x/3.17x/3.36x，MXFP8 未回退。
+数据：[benchmark](records/04-nvfp4-e4m3-scale-fused/benchmark/RESULTS.md)。

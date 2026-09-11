@@ -39,8 +39,9 @@ __device__ inline float magnitude(unsigned code, bool four) {
   return four ? magnitude2(code) : decode_e4m3(code);
 }
 
-// MXFP8 nearest 直接截取指数/尾数；中点严格向较小幅值舍入，不是 nearest-even。
-__device__ inline std::uint8_t encode_mxfp8_nearest(float value) {
+// E4M3 nearest 直接截取 FP32 指数/尾数；中点严格向较小幅值舍入，不是 nearest-even。
+// 两种格式共用：MXFP8 的元素编码，以及 NVFP4 的 E4M3 block scale 编码。
+__device__ inline std::uint8_t encode_e4m3_nearest(float value) {
   const float x = fminf(fabsf(value), 448.0f);
   const unsigned sign = __float_as_uint(value) >> 24 & 0x80u;
   if (x <= 0x1p-10f) return 0;
@@ -64,8 +65,9 @@ __device__ inline std::uint8_t encode_mxfp8_nearest(float value) {
   return code | sign;
 }
 
-// four=true 编码 E2M1，否则 E4M3；baseline 保留枚举，MXFP8 nearest 用直接编码。
-// 随机舍入与 NVFP4 的 E4M3 scale 仍使用原来的二分路径。
+// four=true 编码 E2M1，否则 E4M3；baseline 保留枚举，nearest 用直接编码。
+// 随机舍入仍使用原来的二分路径；NVFP4 的 E4M3 scale 已在 scale_code() 中
+// 改走 encode_e4m3_nearest()，故此处 four=true 的 E2M1 分支才是 NVFP4 编码路径。
 __device__ inline std::uint8_t encode(float value, bool four, bool stochastic,
                                     std::uint32_t seed, std::size_t index,
                                     bool baseline = false) {
@@ -76,7 +78,7 @@ __device__ inline std::uint8_t encode(float value, bool four, bool stochastic,
     return encode_e4m3(value);
   }
 
-  if (!nvfp4 && !four && !stochastic) return encode_mxfp8_nearest(value);
+  if (!nvfp4 && !four && !stochastic) return encode_e4m3_nearest(value);
 
   const unsigned last = four ? 7 : 126;
   const unsigned sign = signbit(value) ? (four ? 8 : 128) : 0;
@@ -201,7 +203,7 @@ __global__ void finalize_max(const float* partial, float* state, unsigned n) {
 
 // 把分组最大绝对值 m 转成 scale 字节：NVFP4 用 E4M3，MXFP8 用 E8M0。
 __device__ inline std::uint8_t scale_code(float m, float global) {
-  if (nvfp4) return encode(m > 0 ? m / (6.0f * global) : 0.0f, false, false, 0, 0);
+  if (nvfp4) return encode_e4m3_nearest(m > 0 ? m / (6.0f * global) : 0.0f);
   if (m == 0) return 127;
   const float ratio = m / 448.0f;
   if (ratio == 0) return 0;
@@ -267,7 +269,48 @@ __global__ void mxfp8_quantize_fused_kernel(const float* input, std::uint8_t* da
   code = __shfl_sync(0xffffffffu, code, 0);
   if (i < n) {
     const float scale = scalbnf(1.0f, static_cast<int>(code) - 127);
-    data[i] = encode_mxfp8_nearest(value / scale);
+    data[i] = encode_e4m3_nearest(value / scale);
+  }
+}
+
+// NVFP4 block+nearest 融合 kernel：一个 warp 覆盖 4 个分组（每线程 2 元素）。
+// 组内用 width=kBlockSize/2 的 shuffle 归约最大值，组首算 scale 后广播，
+// 复用寄存器中的原值编码并打包，input 只读取一次。
+// global_scale 由前面的 maximum/finalize_max 提供，此处只做 per-block 工作。
+// scale 公式、FP32 除法与 s > 0 的守卫保持与原路径一致。
+__global__ void nvfp4_quantize_fused_kernel(const float* input, std::uint8_t* data,
+                                           std::uint8_t* scales, const float* state,
+                                           std::size_t n) {
+  // 每个线程负责一个输出字节，即两个连续元素。
+  const std::size_t item = blockIdx.x * 256ull + threadIdx.x;
+  const std::size_t i = item * 2;
+  const unsigned lane = threadIdx.x & 31;
+  constexpr unsigned kLanesPerGroup = kBlockSize / 2;
+
+  const float low_value = i < n ? input[i] : 0.0f;
+  const float high_value = i + 1 < n ? input[i + 1] : 0.0f;
+
+  // 组内归约：width 限定使每个 kBlockSize/2 个 lane 独立归约。
+  float maximum = fmaxf(fabsf(low_value), fabsf(high_value));
+  for (unsigned step = kLanesPerGroup / 2; step; step >>= 1)
+    maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, step, kLanesPerGroup));
+
+  // 组首线程写 scale；其余 lane 用广播值。i 是组内第一个元素，i < n 即组有效。
+  unsigned code = 0;
+  if (lane % kLanesPerGroup == 0 && i < n) {
+    code = scale_code(maximum, state[1]);
+    scales[i / kBlockSize] = code;
+  }
+  code = __shfl_sync(0xffffffffu, code, 0, kLanesPerGroup);
+
+  if (i < n) {
+    const float scale = state[1] * decode_e4m3(static_cast<std::uint8_t>(code));
+    const unsigned low = encode(scale > 0 ? low_value / scale : 0, true, false, 0, 0, false);
+    const unsigned high = i + 1 < n
+                              ? encode(scale > 0 ? high_value / scale : 0, true, false, 0, 0, false)
+                              : 0;
+    // 偶数元素放低 4 位、奇数放高 4 位；奇数尾部的 nibble 保持为零。
+    data[item] = static_cast<std::uint8_t>(low | (high << 4));
   }
 }
 
@@ -355,6 +398,16 @@ struct Workspace {
     if (!nvfp4 && !options.tensor && !options.stochastic && !baseline) {
       mxfp8_quantize_fused_kernel<<<static_cast<unsigned>(ceil_div(n, 256)), 256>>>(
           input.ptr, data.ptr, scales.ptr, n);
+      return;
+    }
+
+    // NVFP4 block+nearest：全局归约仍是必要前置（global_scale 依赖全张量最大值），
+    // 之后的 scale 计算与编码合并为一个 kernel，input 由读 3 遍降为读 2 遍。
+    if (nvfp4 && !options.tensor && !options.stochastic && !baseline) {
+      maximum<<<partials, 256>>>(input.ptr, scratch.ptr, n);
+      finalize_max<<<1, 256>>>(scratch.ptr, state.ptr, partials);
+      nvfp4_quantize_fused_kernel<<<static_cast<unsigned>(ceil_div(data_size(n), 256)), 256>>>(
+          input.ptr, data.ptr, scales.ptr, state.ptr, n);
       return;
     }
 
