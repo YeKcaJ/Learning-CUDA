@@ -17,18 +17,31 @@ if(BUILD_TESTING)
   add_test(NAME core_tools COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tools.py)
 endif()
 
-# 同一套核心源码编译为两个独立程序，格式在编译时确定。
+# 每个模块独立编译；只有 runtime/workspace.cu 包含正式 kernel 定义。
+# reference 位于 Core 内，普通运行也使用它校验结果，不再包含目录外源码。
+set(CORE_SOURCES
+  app/main.cpp
+  app/run.cu
+  runtime/workspace.cu
+  benchmarks/benchmark.cu
+  reference/oracle.cpp
+  reference/frozen.cpp
+)
+
+# 同一套源码按格式编译两次，保留现有可执行名称与 Python 调用协议。
 foreach(FORMAT IN ITEMS mxfp8 nvfp4)
   set(TARGET pipeline_${FORMAT})
-  add_executable(${TARGET} pipeline_main.cu tests/reference.cpp)
+  add_executable(${TARGET} ${CORE_SOURCES})
+  target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_options(${TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
   if(FORMAT STREQUAL "nvfp4")
     target_compile_definitions(${TARGET} PRIVATE TEST_NVFP4)
   endif()
 
   if(BUILD_TESTING)
-    string(TOUPPER "${FORMAT}" UPPER_FORMAT)
-    set(CPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../CPU${UPPER_FORMAT}")
+    set(CPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/reference/${FORMAT}")
+    target_sources(${TARGET} PRIVATE tests/regression.cu)
+    target_compile_definitions(${TARGET} PRIVATE LP_ENABLE_TESTS LP_REFERENCE_DIR="${CPU_DIR}")
     add_test(NAME ${FORMAT}_pipeline_io
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.py
               ${FORMAT} $<TARGET_FILE:${TARGET}>)

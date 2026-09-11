@@ -73,7 +73,8 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(len(calls), 6)
             self.assertEqual({Path(c[0]).parent for c in calls}, {CORE / "build"})
             metadata = json.loads((output / "environment.json").read_text())
-            for name in ("pipeline.cuh", "codec.cuh", "CMakeLists.txt", "../CPUNVFP4/main.cpp"):
+            for name in ("runtime/workspace.cu", "kernels/codec.cuh", "CMakeLists.txt",
+                         "reference/nvfp4/main.cpp", "app/main.cpp"):
                 self.assertIn(name, metadata["source_sha256"])
             self.assertEqual(len(json.loads((output / "summary.json").read_text())), 6)
             self.assertTrue((output / "RESULTS.md").is_file())
@@ -86,7 +87,7 @@ class ToolTests(unittest.TestCase):
 
                 def fake_run(command, **kwargs):
                     calls.append(command)
-                    text = "pipeline::quantize_kernel pipeline::mxfp8_quantize_fused_kernel" if valid else "SKIPPED"
+                    text = "pipeline::nvfp4_quantize_fused_kernel pipeline::mxfp8_quantize_fused_kernel" if valid else "SKIPPED"
                     return subprocess.CompletedProcess(command, 0, text, "")
 
                 output = Path(folder) / "profile"
@@ -103,9 +104,9 @@ class ToolTests(unittest.TestCase):
                         self.assertEqual(Path(call[-4]).parent, CORE / "build")
                 self.assertTrue((output / "mxfp8_stats.txt").is_file())
 
-    def test_legacy_help_entrypoints(self):
+    def test_formal_help_entrypoints(self):
         for name in ("quantize", "benchmark", "profile"):
-            result = subprocess.run([sys.executable, str(CORE.parent / "tools" / (name + ".py")),
+            result = subprocess.run([sys.executable, str(CORE / "tools" / (name + ".py")),
                                      "--help"], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("usage:", result.stdout)

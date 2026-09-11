@@ -56,7 +56,7 @@ def main():
         (directory / f"{fmt}_stats.txt").write_text(result.stdout + result.stderr)
         result.check_returncode()
         # 返回码成功不代表采到了 GPU 数据；还需检查核心 kernel 是否出现在报告中。
-        expected = "pipeline::mxfp8_quantize_fused_kernel" if fmt == "mxfp8" else "pipeline::quantize_kernel"
+        expected = f"pipeline::{fmt}_quantize_fused_kernel"
         if expected not in result.stdout or "SKIPPED" in result.stdout:
             raise RuntimeError(f"missing profiler data for {fmt}; inspect capture log")
         print(f"{fmt}: kernel/API/memory data collected", flush=True)

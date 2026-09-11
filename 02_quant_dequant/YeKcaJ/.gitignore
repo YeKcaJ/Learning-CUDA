@@ -1,5 +1,6 @@
 **/build/
 **/__pycache__/
+legacy/build-cache/
 input/**/*.fp32
 input/**/*.fp16
 profiles/*.nsys-rep

@@ -203,7 +203,7 @@ def run(cfg, source, prefix=None, console_json=False):
     for path in (packed, output, log):
         if path.exists():
             raise ValueError(f"output exists, use a new prefix: {path}")
-    # 参数顺序对应 pipeline_main.cu 的 main；verify 启用 CPU 量化逐字节校验。
+    # 参数顺序对应 app/run.cu；verify 启用 CPU 量化逐字节校验。
     command = [
         str(binary),
         str(source),

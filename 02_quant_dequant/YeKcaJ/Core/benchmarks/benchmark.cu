@@ -1,0 +1,119 @@
+// FP32 驻留 GPU、host_api 和 CPU 基准；独立于普通文件任务。
+#include "app/commands.h"
+#include "runtime/workspace.cuh"
+#include "reference/oracle.h"
+#include "common/timing.h"
+#include <cmath>
+#include <iostream>
+#include <random>
+
+namespace pipeline {
+
+// 调用方提供非空样本；中位数取中间值/均值，其他分位数使用 nearest-rank。
+double percentile(std::vector<double> x, double p) {
+  std::sort(x.begin(), x.end());
+  if (p == .5 && x.size() % 2 == 0)
+    return (x[x.size() / 2 - 1] + x[x.size() / 2]) / 2;
+  return x[static_cast<std::size_t>(std::ceil(p * x.size())) - 1];
+}
+
+// 输出一条机器可读的性能记录；bytes 是逻辑读写量，不是实测 DRAM 流量。
+void stats(const char* op, const char* scope, std::size_t n, const std::vector<double>& samples,
+           double bytes) {
+  const double med = percentile(samples, .5);
+  std::cout << "{\"format\":\"" << format_name << "\",\"op\":\"" << op << "\",\"scope\":\"" << scope
+            << "\",\"elements\":" << n << ",\"repeats\":" << samples.size()
+            << ",\"median_ms\":" << med << ",\"p95_ms\":" << percentile(samples, .95)
+            << ",\"logical_GBps\":" << (med > 0 ? bytes / (med * 1e6) : 0) << "}\n";
+}
+
+// 单一输出类型的驻留 GPU 测试：预热 3 次，复用显存，仅计反量化 kernel。
+template <typename T>
+void bench_dequant(Workspace& w, int repeats) {
+  for (int i = 0; i < 3; ++i)
+    w.events.measure([&] { w.launch_dequant<T>(); });
+  std::vector<double> times;
+  for (int i = 0; i < repeats; ++i)
+    times.push_back(w.events.measure([&] { w.launch_dequant<T>(); }));
+  const std::string op = std::string("dequant_") + cuda_output::Format<T>::name;
+  stats(op.c_str(), "resident_gpu", w.n, times,
+        w.n * sizeof(T) + data_size(w.n) + w.groups + (nvfp4 ? 4 : 0));
+}
+
+// 固定 FP32 正态输入与 seed，测试 block + nearest；n 和重复次数来自命令行。
+// quant_enumeration 是内部算法对照，quant_optimized 才是当前默认实现。
+// 做后续优化时，应比较修改前后 quant_optimized，而非把内部对照当作当前 B0。
+void benchmark(std::size_t n, int repeats) {
+  if (!n || n > (1u << 26) || repeats < 1 || repeats > 1000)
+    throw std::runtime_error("benchmark: n must be 1..2^26, repeats 1..1000");
+  Tensor t{1, n, 4, std::vector<float>(n)};
+  std::mt19937 rng(20260909);
+  std::normal_distribution<float> normal;
+  for (auto& v : t.values)
+    v = normal(rng);
+  Options o;
+  Workspace w(n, o);
+  w.upload(t.values);
+  for (int i = 0; i < 3; ++i) {
+    w.events.measure([&] { w.launch_quant(true); });
+    w.events.measure([&] { w.launch_quant(); });
+  }
+  std::vector<double> baseline, optimized;
+  // 交替顺序减小 GPU 温度、时钟漂移对基线和优化版本比较的影响。
+  for (int i = 0; i < repeats; ++i) {
+    if (i % 2) {
+      optimized.push_back(w.events.measure([&] { w.launch_quant(); }));
+      baseline.push_back(w.events.measure([&] { w.launch_quant(true); }));
+    } else {
+      baseline.push_back(w.events.measure([&] { w.launch_quant(true); }));
+      optimized.push_back(w.events.measure([&] { w.launch_quant(); }));
+    }
+  }
+  const double bytes = 4 * n + data_size(n) + w.groups + (nvfp4 ? 4 : 0);
+  stats("quant_enumeration", "resident_gpu", n, baseline, bytes);
+  stats("quant_optimized", "resident_gpu", n, optimized, bytes);
+  // 先确认两条量化路径逐字节一致，再用现有结果测试三种反量化输出。
+  w.events.measure([&] { w.launch_quant(); });
+  auto q = w.download(t);
+  w.events.measure([&] { w.launch_quant(true); });
+  compare_packed(q, w.download(t));
+  bench_dequant<float>(w, repeats);
+  bench_dequant<__half>(w, repeats);
+  bench_dequant<__nv_bfloat16>(w, repeats);
+  // 单次完整量化调用包括申请/释放与传输；与驻留 GPU 指标分开记录。
+  std::vector<double> wall;
+  for (int i = -3; i < repeats; ++i) {
+    const auto start = Clock::now();
+    {
+      Workspace fresh(n, o);
+      fresh.upload(t.values);
+      fresh.events.measure([&] { fresh.launch_quant(); });
+      auto result = fresh.download(t);
+      if (result.data.size() != data_size(n))
+        throw std::runtime_error("bad result");
+    }
+    if (i >= 0)
+      wall.push_back(elapsed(start));
+  }
+  stats("quant_optimized", "host_api", n, wall, bytes);
+  // CPU 对照使用冻结的枚举编码规则，仅在 1M 预跑一次、计时三次。
+  if (n == (1u << 20)) {
+    auto cpu = reference_quantize(t, o);
+    compare_packed(q, cpu);
+    std::vector<double> quant, dequant;
+    for (int i = 0; i < 3; ++i) {
+      auto start = Clock::now();
+      cpu = reference_quantize(t, o);
+      quant.push_back(elapsed(start));
+      start = Clock::now();
+      auto y = reference_dequantize(cpu);
+      dequant.push_back(elapsed(start));
+      if (y.size() != n)
+        throw std::runtime_error("CPU output length mismatch");
+    }
+    stats("quant_reference", "cpu", n, quant, bytes);
+    stats("dequant_fp32", "cpu", n, dequant, bytes);
+  }
+}
+
+}  // namespace pipeline

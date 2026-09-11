@@ -10,8 +10,8 @@ import contextlib
 import io
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "Core/tools"))
+CORE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(CORE / "tools"))
 from quantize import read_config, run, format_summary
 
 FORMAT = sys.argv.pop(1)
@@ -121,7 +121,7 @@ class PipelineTests(unittest.TestCase):
                 read_config(config)
 
     def test_console_summary_and_json(self):
-        cfg = read_config(ROOT / "Core/configs" / (FORMAT + ".toml"))
+        cfg = read_config(CORE / "configs" / (FORMAT + ".toml"))
         source = self.input([.125, -.5, 1.0])
         for raw in (False, True):
             prefix = self.directory / ("raw" if raw else "pretty")
@@ -145,7 +145,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_automatic_output_roundtrip(self):
         import quantize
-        cfg = read_config(ROOT / "Core/configs" / (FORMAT + ".toml"))
+        cfg = read_config(CORE / "configs" / (FORMAT + ".toml"))
         with patch.object(quantize, "PROJECT", self.directory), \
              patch("quantize.executable", return_value=BINARY), \
              contextlib.redirect_stdout(io.StringIO()):

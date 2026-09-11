@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 # 调用两种格式的 pipeline --benchmark；固定 1M/4M/16M，不读取 TOML。
-# 输入生成、预热和计时由 pipeline_main.cu 的 benchmark 完成。
+# 输入生成、预热和计时由 benchmarks/benchmark.cu 完成。
 def main():
     # ===== 1. 参数与独立结果目录 =====
     parser = argparse.ArgumentParser(description=__doc__)
@@ -30,7 +30,7 @@ def main():
         return subprocess.check_output(cmd, text=True).strip()
 
     # ===== 2. 硬件、工具版本与源码标识 =====
-    # 记录 Core 源码/配置/构建定义及外部 CPU 算法；哈希不能代替源码备份。
+    # 记录 Core 的所有模块及内部 CPU reference；哈希不能代替源码备份。
     metadata = dict(
         date=datetime.datetime.now().astimezone().isoformat(),
         repeats=args.repeats,
@@ -52,11 +52,6 @@ def main():
             )
         },
     )
-    for fmt in ("MXFP8", "NVFP4"):
-        source = ROOT.parent / ("CPU" + fmt) / "main.cpp"
-        metadata["source_sha256"]["../CPU" + fmt + "/main.cpp"] = hashlib.sha256(
-            source.read_bytes()
-        ).hexdigest()
     (directory / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
     # ===== 3. 串行执行，保存每种格式和规模的原始 JSONL =====
     # 不并行启动 GPU 任务，以免资源争用影响计时。
@@ -83,7 +78,7 @@ def main():
         "# 性能测试结果",
         "",
         "GPU 驻留计时使用 CUDA event；host_api 包括量化的分配、传输和释放。",
-        "内部对照使用 shared scale 归约与枚举编码；MXFP8 默认使用 scale/直接编码融合 kernel，NVFP4 默认保留分组归约和快速编码。不是原始 CLI 的完整实现对比。",
+        "内部对照保留 shared scale 归约与枚举元素编码；两种格式的默认 block+nearest 均使用 scale/编码融合 kernel，NVFP4 另含两级全局归约。内部对照的 scale 也可能共享优化，优化前后请比较留存的 quant_optimized 记录。",
         "中位数采用偶数样本中间两值均值，P95 使用 nearest-rank。CPU 仅测试 1M，预热一次后计时三次。",
         "",
         "| 格式 | 操作 | 范围 | 元素数 | median ms | P95 ms | 逻辑 GB/s |",
