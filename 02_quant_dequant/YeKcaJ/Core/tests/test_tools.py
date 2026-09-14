@@ -36,13 +36,13 @@ class ToolTests(unittest.TestCase):
             metadata = json.loads(first.with_suffix(".json").read_text())
             self.assertEqual(metadata["input_sha256"], tool.input_sha256(first))
             self.assertEqual(metadata["seed"], 1234)
-            cfg = {"format": "nvfp4"}
+            cfg = {"format": "nvfp4", "output_type": "fp32"}
             one = tool.automatic_prefix(first, cfg)
             two = tool.automatic_prefix(first, cfg)
             self.assertEqual(one.relative_to(folder).as_posix(),
-                             "results/fp16/910/1/nvfp4/run-1/result")
-            self.assertEqual(two.parent.name, "run-2")
-            self.assertEqual(tool.automatic_prefix(first, {"format": "mxfp8"}).parent.name, "run-1")
+                             "output/910/1/nvfp4/fp16_fp32")
+            self.assertEqual(two.name, "fp16_fp32")
+            self.assertEqual(tool.automatic_prefix(first, {"format": "mxfp8", "output_type": "fp32"}).name, "fp16_fp32")
             self.assertEqual(first.read_bytes(), original)
             with self.assertRaises(FileExistsError):
                 tool.generate(first, 1, 33, "fp16", "normal", 99)

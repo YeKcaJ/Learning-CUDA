@@ -133,7 +133,7 @@ python3 Core/tools/quantize.py run --config Core/configs/nvfp4.toml \
   --input input/fp32/911/1.fp32
 ```
 
-替换示例日期和编号。输出在 `results/fp32/911/1/<格式>/run-N/`：result.lpq 是权重，result.<output_type> 是反量化张量，result.json 是配置、误差、压缩率、计时及输入哈希。
+替换示例日期和编号。输出在 `output/fp32/911/1/<格式>/run-N/`，分为 `weights/result.lpq`、`tensors/result.<output_type>` 和 `logs/result.json` 三类。
 重复执行增加 run 编号。外部输入使用 `--prefix` 指定新的输出前缀。
 
 **④ 独立反量化已有权重**

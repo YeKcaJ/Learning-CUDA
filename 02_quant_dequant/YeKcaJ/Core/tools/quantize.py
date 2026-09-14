@@ -33,17 +33,17 @@ def automatic_prefix(source, cfg):
     with source.open("rb") as stream:
         if stream.read(8) != (b"FP16INP1" if dtype == "fp16" else b"FP32INP1"):
             raise ValueError("input header does not match its dtype directory")
-    directory = PROJECT / "results" / dtype / day / Path(filename).stem / cfg["format"]
+    directory = PROJECT / "output" / day / Path(filename).stem / cfg["format"]
     directory.mkdir(parents=True, exist_ok=True)
     # mkdir 独占编号；重复/并发运行不会复用同一个结果目录。
     index = 1
+    stem = f"{dtype}_{cfg['output_type']}"
     while True:
-        run_dir = directory / f"run-{index}"
-        try:
-            run_dir.mkdir()
-            return run_dir / "result"
-        except FileExistsError:
-            index += 1
+        suffix = "" if index == 1 else f"_{index}"
+        prefix = directory / (stem + suffix)
+        if not any(Path(str(prefix) + ext).exists() for ext in (".lpq", "." + cfg["output_type"], ".json")):
+            return prefix
+        index += 1
 
 
 # 分块计算哈希，避免为了日志再次将大输入完整读入内存。
@@ -191,12 +191,12 @@ def run(cfg, source, prefix=None, console_json=False):
     source = Path(source).resolve()
     binary = executable(cfg["format"])
     source_hash = input_sha256(source)
-    prefix = automatic_prefix(source, cfg) if prefix is None else Path(prefix).resolve()
-    packed, output, log = (
-        Path(str(prefix) + ".lpq"),
-        Path(str(prefix) + "." + cfg["output_type"]),
-        Path(str(prefix) + ".json"),
-    )
+    automatic = prefix is None
+    prefix = automatic_prefix(source, cfg) if automatic else Path(prefix).resolve()
+    if automatic:
+        packed, output, log = (Path(str(prefix) + ".lpq"), Path(str(prefix) + "." + cfg["output_type"]), Path(str(prefix) + ".json"))
+    else:
+        packed, output, log = (Path(str(prefix) + ".lpq"), Path(str(prefix) + "." + cfg["output_type"]), Path(str(prefix) + ".json"))
     if source in (packed, output, log):
         raise ValueError("output paths must differ from input")
     # 默认不覆盖已有结果；换前缀即可保留不同配置的实验记录。

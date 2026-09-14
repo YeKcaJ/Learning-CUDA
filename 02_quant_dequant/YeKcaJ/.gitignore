@@ -13,6 +13,10 @@ results/**/*.lpq
 results/**/*.fp32
 results/**/*.fp16
 results/**/*.bf16
+output/**/*.lpq
+output/**/*.fp32
+output/**/*.fp16
+output/**/*.bf16
 records/**/*.nsys-rep
 records/**/*.sqlite
 records/**/*.qdstrm

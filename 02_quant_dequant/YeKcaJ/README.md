@@ -22,7 +22,7 @@
 YeKcaJ/
 ├── Core/                  正式源码、配置、CPU reference 与测试
 ├── input/                 输入：fp16或fp32 / 月日 / 编号
-├── results/               与输入对应的运行输出
+├── output/                分为 weights、tensors、logs 的运行输出
 ├── records/               性能实验、nsys 和验证证据
 ├── docs/                  题目 PDF、文件规范、阶段报告
 ├── legacy/                旧实现与旧入口存档，不参与正式构建
@@ -51,7 +51,7 @@ python3 Core/tools/quantize.py run --config Core/configs/mxfp8.toml \
 ```
 
 输入路径请替换成 generate 实际打印的路径。修改配置中的 `output_type` 选择 fp32/fp16/bf16。
-输出自动保存为 `results/<输入类型>/<月日>/<编号>/<量化格式>/run-N/result.*`，包括 packed 权重、反量化张量和 JSON 日志。
+输出自动保存为 `output/<输入类型>/<月日>/<编号>/<量化格式>/run-N/{weights,tensors,logs}/`，分别存放 packed 权重、反量化张量和 JSON 日志。
 输入文件带格式和尺寸头，不能直接把无头原始数组改扩展名使用。
 
 ## 性能优化
