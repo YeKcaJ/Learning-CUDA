@@ -23,8 +23,7 @@
 | 测试 | 每格式 29 个 CTest、固定 golden 哈希、GPU 三类 sanitizer |
 | nsys 分析 | 两种格式均成功采集 CUDA kernel/API/传输数据，并指导 scale kernel 优化 |
 
-仍未执行的是远端提交：当前分支 `mxfp8-YeKcaJ`，未自动切换、commit、push 或创建 PR。
-实际 T4/国产平台、原生 FP8/FP4 路径和 ncu 是未实施的硬件验证/扩展项，不计入本次完成声明。
+国产平台适配（摩尔线程、沐曦、华为昇腾）尚未实施；实际 T4、原生 FP8/FP4 路径也未验证，不计入本次完成声明。适配计划见 [国产平台适配记录](PLATFORM_ADAPTATION.md)。
 
 ## 格式与数学过程
 

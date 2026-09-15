@@ -1,7 +1,7 @@
 # MXFP8 / NVFP4 量化程序
 
 选题 2。正式程序只维护 **Core**，使用入口是 `Core/tools/quantize.py`。
-支持 FP32/FP16 输入、MXFP8/NVFP4 packed 权重、FP32/FP16/BF16 反量化输出。
+支持 FP32/FP16 输入、MXFP8/NVFP4 packed 权重、FP32/FP16/BF16 反量化输出。当前正式后端为 NVIDIA CUDA；国产平台适配计划与验收口径见 [国产平台适配记录](docs/PLATFORM_ADAPTATION.md)。
 支持 block/tensor 缩放与 nearest/stochastic 舍入。FP16 输入先在 CPU 精确展开为 FP32，GPU 量化输入目前统一为 FP32；不支持 BF16 输入。
 
 ## 找代码
