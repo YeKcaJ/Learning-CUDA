@@ -19,7 +19,7 @@ __global__ void dequantize_kernel(const std::uint8_t* data, const std::uint8_t* 
   const float value = nvfp4 ? ((code & 8) ? -magnitude2(code & 7) : magnitude2(code & 7))
                             : decode_e4m3(code);
   output[i] = cuda_output::Format<T>::convert(
-      value * effective(scales, state, group == kBlockSize ? i / kBlockSize : 0));
+      multiply_rn(value, effective(scales, state, group == kBlockSize ? i / kBlockSize : 0)));
 }
 
 }  // namespace pipeline

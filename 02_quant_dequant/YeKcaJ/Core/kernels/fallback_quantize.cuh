@@ -50,11 +50,11 @@ __global__ void quantize_kernel(const float* input, std::uint8_t* data, const st
   if (i >= n) return;
 
   const float s = effective(scales, state, group == kBlockSize ? i / kBlockSize : 0);
-  const auto low = encode(s > 0 ? input[i] / s : 0, nvfp4, stochastic, seed, i, Baseline);
+  const auto low = encode(s > 0 ? divide_rn(input[i], s) : 0, nvfp4, stochastic, seed, i, Baseline);
   if (nvfp4) {
     // 每线程独占 packed 字节；奇数尾部的高 nibble 保持为零。
     const auto high = i + 1 < n
-                          ? encode(s > 0 ? input[i + 1] / s : 0, true, stochastic,
+                          ? encode(s > 0 ? divide_rn(input[i + 1], s) : 0, true, stochastic,
                                    seed, i + 1, Baseline)
                           : 0;
     data[item] = low | (high << 4);

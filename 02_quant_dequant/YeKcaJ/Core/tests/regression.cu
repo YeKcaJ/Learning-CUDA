@@ -9,6 +9,36 @@
 
 namespace pipeline {
 
+// 自测时临时替换输出显存，前后各填哨兵；析构恢复 Workspace 原始指针。
+// 这能检测越界写，但不能替代平台工具对越界读和数据竞争的检查。
+template <typename T>
+struct GuardedOutput {
+  DeviceBuffer<T>& target;
+  DeviceBuffer<T> storage;
+  std::vector<std::uint8_t> bytes;
+  GuardedOutput(DeviceBuffer<T>& buffer, std::size_t count)
+      : target(buffer), storage(count + 64), bytes((count + 64) * sizeof(T), 0xa5) {
+    CUDA_CHECK(cudaMemcpy(storage.ptr, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
+    std::swap(target.ptr, storage.ptr);
+    target.ptr += 32;  // 偏移保持向量读写所需的对齐；storage.ptr 保存原始显存。
+  }
+  ~GuardedOutput() { target.ptr -= 32; std::swap(target.ptr, storage.ptr); }
+  void check(std::size_t written_bytes) {
+    CUDA_CHECK(cudaMemcpy(bytes.data(), target.ptr - 32, bytes.size(), cudaMemcpyDeviceToHost));
+    for (std::size_t i = 0; i < bytes.size(); ++i)
+      if ((i < 32 * sizeof(T) || i >= 32 * sizeof(T) + written_bytes) && bytes[i] != 0xa5)
+        throw std::runtime_error("output front/back guard overwritten");
+  }
+};
+
+template <typename T>
+void check_guarded_dequant(Workspace& w, const std::vector<float>& expected) {
+  GuardedOutput<float> guard(w.output, w.n);
+  w.events.measure([&] { w.launch_dequant<T>(); });
+  cuda_output::compare(w.download_output<T>(), expected);
+  guard.check(w.n * sizeof(T));
+}
+
 // 自测 kernel：每线程独立编码一个值，输出编码字节，不计算 scale 或 packed 数据。
 // 用于隔离检查编码器的舍入边界与随机种子；不参与正常量化或 benchmark。
 __global__ void encoder_probe(const float* values, std::uint8_t* codes, std::size_t n,
@@ -101,19 +131,20 @@ void self_test(const std::string& cpu_dir) {
         if (n)
           t.values.back() = -0.0f;
         Workspace w(n, o);
+        GuardedOutput<std::uint8_t> data_guard(w.data, data_size(n));
+        GuardedOutput<std::uint8_t> scale_guard(w.scales, w.groups);
         w.upload(t.values);
         w.events.measure([&] { w.launch_quant(); });
         const auto q = w.download(t);
         compare_packed(q, reference_quantize(t, o));
         const auto y = reference_dequantize(q);
-        w.events.measure([&] { w.launch_dequant<float>(); });
-        cuda_output::compare(w.download_output<float>(), y);
-        w.events.measure([&] { w.launch_dequant<__half>(); });
-        cuda_output::compare(w.download_output<__half>(), y);
-        w.events.measure([&] { w.launch_dequant<__nv_bfloat16>(); });
-        cuda_output::compare(w.download_output<__nv_bfloat16>(), y);
+        check_guarded_dequant<float>(w, y);
+        check_guarded_dequant<__half>(w, y);
+        check_guarded_dequant<__nv_bfloat16>(w, y);
         w.events.measure([&] { w.launch_quant(); });
         compare_packed(q, w.download(t));
+        data_guard.check(data_size(n));
+        scale_guard.check(w.groups);
         ++checked;
       }
     }
@@ -137,7 +168,12 @@ void self_test(const std::string& cpu_dir) {
     Workspace w(33, o);
     w.upload(t.values);
     w.events.measure([&] { w.launch_quant(); });
-    compare_packed(w.download(t), reference_quantize(t, o));
+    try {
+      compare_packed(w.download(t), reference_quantize(t, o));
+    } catch (const std::exception&) {
+      std::cerr << "extreme input=" << v << '\n';
+      throw;
+    }
     ++checked;
   }
   check_encoder();
@@ -163,6 +199,7 @@ void self_test(const std::string& cpu_dir) {
     std::cout << "mxfp8_fused_scale_cases=270 status=PASS\n";
   }
   std::cout << "pipeline_cases=" << checked << " status=PASS\n";
+  std::cout << "guarded_cases=288 guards=front,back outputs=data,scales,fp32,fp16,bf16 status=PASS\n";
 }
 
 }  // namespace pipeline

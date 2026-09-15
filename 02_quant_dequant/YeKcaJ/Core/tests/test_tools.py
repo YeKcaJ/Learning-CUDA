@@ -20,6 +20,32 @@ def load_tool(name):
 
 
 class ToolTests(unittest.TestCase):
+    def test_comparison_rejects_changed_conditions(self):
+        tool = load_tool("compare_benchmarks")
+        env = dict(protocol="fixed-fp32-v1", formal=True,
+                   input=dict(dtype="fp32", shape="1 x elements", elements=[1 << 20, 4 << 20, 16 << 20],
+                              generator_seed=20260909, sha256=tool.INPUT_HASHES),
+                   quantization=dict(scale_mode="block", rounding="nearest", seed=1234,
+                                     block_size=dict(mxfp8=32, nvfp4=16)),
+                   metric=dict(op="quant_optimized", scope="resident_gpu", statistic="median_ms",
+                               p95="nearest-rank", output_types=["fp32", "fp16", "bf16"]),
+                   warmups=3, repeats=20)
+        tool.validate_pair(env, dict(env))
+        for change in ({"input": {"sha256": {"1M": "different"}}}, {"repeats": 5},
+                       {"formal": False}, {"metric": {"scope": "host_api"}}):
+            with self.assertRaises(ValueError):
+                tool.validate_pair(env, dict(env, **change))
+            with self.assertRaises(ValueError):
+                tool.validate_pair(dict(env, **change), dict(env, **change))
+
+    def test_backend_selection(self):
+        tool = load_tool("quantize")
+        with patch.object(Path, "is_file", return_value=True):
+            self.assertEqual(tool.executable("nvfp4", "musa"), CORE / "build-musa" / "pipeline_nvfp4")
+            self.assertEqual(tool.executable("mxfp8"), CORE / "build" / "pipeline_mxfp8")
+            with self.assertRaises(ValueError):
+                tool.executable("mxfp8", "unknown")
+
     def test_automatic_inputs_and_result_numbering(self):
         tool = load_tool("quantize")
         with tempfile.TemporaryDirectory() as folder, patch.object(tool, "PROJECT", Path(folder)), \
@@ -37,12 +63,12 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(metadata["input_sha256"], tool.input_sha256(first))
             self.assertEqual(metadata["seed"], 1234)
             cfg = {"format": "nvfp4", "output_type": "fp32"}
-            one = tool.automatic_prefix(first, cfg)
-            two = tool.automatic_prefix(first, cfg)
+            one = tool.automatic_prefix(first, cfg, "cuda")
+            two = tool.automatic_prefix(first, cfg, "cuda")
             self.assertEqual(one.relative_to(folder).as_posix(),
-                             "output/910/1/nvfp4/fp16_fp32")
+                             "output/910/1/nvfp4/cuda/fp16_fp32")
             self.assertEqual(two.name, "fp16_fp32")
-            self.assertEqual(tool.automatic_prefix(first, {"format": "mxfp8", "output_type": "fp32"}).name, "fp16_fp32")
+            self.assertEqual(tool.automatic_prefix(first, {"format": "mxfp8", "output_type": "fp32"}, "musa").name, "fp16_fp32")
             self.assertEqual(first.read_bytes(), original)
             with self.assertRaises(FileExistsError):
                 tool.generate(first, 1, 33, "fp16", "normal", 99)
@@ -66,7 +92,9 @@ class ToolTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / "benchmark"
-            with patch.object(sys, "argv", ["benchmark", "--directory", str(output), "--repeats", "1"]), \
+            with patch.object(sys, "argv", ["benchmark", "--directory", str(output)]), \
+                 patch.object(tool, "fixed_inputs", return_value={str(n): "hash" for n in tool.SIZES}), \
+                 patch.object(tool, "file_hash", return_value="binary-hash"), \
                  patch.object(tool.subprocess, "check_output", return_value="test environment"), \
                  patch.object(tool.subprocess, "run", side_effect=fake_run):
                 tool.main()
@@ -78,6 +106,24 @@ class ToolTests(unittest.TestCase):
                 self.assertIn(name, metadata["source_sha256"])
             self.assertEqual(len(json.loads((output / "summary.json").read_text())), 6)
             self.assertTrue((output / "RESULTS.md").is_file())
+
+    def test_fixed_benchmark_rejects_modified_input(self):
+        tool = load_tool("benchmark")
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            for n in tool.SIZES:
+                (directory / f"normal_{n}.fp32").write_bytes(b"fixed corpus")
+            expected = {str(n): tool.file_hash(directory / f"normal_{n}.fp32") for n in tool.SIZES}
+            with patch.object(tool, "EXPECTED_INPUT_HASHES", expected):
+                first = tool.fixed_inputs(CORE / "build", directory)
+                self.assertEqual(tool.fixed_inputs(CORE / "build", directory), first)
+                (directory / f"normal_{tool.SIZES[0]}.fp32").write_bytes(b"changed")
+                with self.assertRaises(ValueError):
+                    tool.fixed_inputs(CORE / "build", directory)
+            # 删除本地清单也不能把新输入冒充冻结的 v1 数据。
+            (directory / "manifest.json").unlink()
+            with self.assertRaises(ValueError):
+                tool.fixed_inputs(CORE / "build", directory)
 
     def test_profile_paths_and_missing_data(self):
         tool = load_tool("profile")

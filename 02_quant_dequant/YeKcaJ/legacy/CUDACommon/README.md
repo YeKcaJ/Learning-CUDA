@@ -4,7 +4,7 @@
 
 2026-09-09 更新：新增可配置算子 `pipeline.cuh`、文件协议 `pipeline_io.h` 和入口
 `pipeline_main.cu`。本目录现在不只包含输出辅助代码，也包含 v2 扩展算子。
-详见 [项目 README](../README.md)、[扩展规范](../EXTENDED_SPEC.md) 和 [最终报告](../FINAL_REPORT.md)。
+详见 [项目 README](../README.md) 和 [最终报告](../FINAL_REPORT.md)。
 两个工程现在各 29 个 CTest：保留 27 个旧测试，增加 pipeline_regression 和 pipeline_io。
 下文 27 项和旧 benchmark 的描述保留作历史说明；新性能脚本为 `tools/benchmark.py`。
 

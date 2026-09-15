@@ -16,14 +16,19 @@ int main(int argc, char** argv) {
           << "文件任务: pipeline input packed output block|tensor nearest|stochastic "
              "fp32|fp16|bf16 block_size seed verify|noverify\n"
           << "反量化:   pipeline --dequant-file packed output fp32|fp16|bf16\n"
-          << "性能测试: pipeline --benchmark elements repeats\n";
+          << "性能测试: pipeline --benchmark elements repeats [fixed_input.fp32]\n"
+          << "固定输入: pipeline --benchmark-export elements output.fp32\n";
 #ifdef LP_ENABLE_TESTS
       std::cout << "正确性:   pipeline --self-test [reference_directory]\n";
 #endif
       return 0;
     }
-    if (argc == 4 && command == "--benchmark") {
-      benchmark(std::stoull(argv[2]), std::stoi(argv[3]));
+    if ((argc == 4 || argc == 5) && command == "--benchmark") {
+      benchmark(std::stoull(argv[2]), std::stoi(argv[3]), argc == 5 ? argv[4] : "");
+      return 0;
+    }
+    if (argc == 4 && command == "--benchmark-export") {
+      export_benchmark_input(std::stoull(argv[2]), argv[3]);
       return 0;
     }
     if ((argc == 2 || argc == 3) && command == "--self-test") {

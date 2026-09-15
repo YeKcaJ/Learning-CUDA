@@ -66,7 +66,13 @@ __global__ void mxfp8_quantize_vectorized_kernel(const float* input, std::uint8_
   for (unsigned j = 0; j < 4; ++j)
     if (base + j < n)
       packed |= static_cast<std::uint32_t>(encode_e4m3_nearest(values[j] / scale)) << (8 * j);
-  if (base < n) *reinterpret_cast<std::uint32_t*>(data + group * 32ull + sublane * 4ull) = packed;
+  if (base + 3 < n) {
+    *reinterpret_cast<std::uint32_t*>(data + base) = packed;
+  } else {
+    // 尾部不足 4 字节时逐字节写，避免 uint32 存储越过输出缓冲区。
+    for (unsigned j = 0; j < 4 && base + j < n; ++j)
+      data[base + j] = static_cast<std::uint8_t>(packed >> (8 * j));
+  }
 }
 
 }  // namespace pipeline

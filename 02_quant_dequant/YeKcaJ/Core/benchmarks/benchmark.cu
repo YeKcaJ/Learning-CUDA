@@ -3,6 +3,9 @@
 #include "runtime/workspace.cuh"
 #include "reference/oracle.h"
 #include "common/timing.h"
+#include "io/tensor_io.h"
+#include <filesystem>
+#include <fstream>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -43,14 +46,34 @@ void bench_dequant(Workspace& w, int repeats) {
 // 固定 FP32 正态输入与 seed，测试 block + nearest；n 和重复次数来自命令行。
 // quant_enumeration 是内部算法对照，quant_optimized 才是当前默认实现。
 // 做后续优化时，应比较修改前后 quant_optimized，而非把内部对照当作当前 B0。
-void benchmark(std::size_t n, int repeats) {
-  if (!n || n > (1u << 26) || repeats < 1 || repeats > 1000)
-    throw std::runtime_error("benchmark: n must be 1..2^26, repeats 1..1000");
+Tensor benchmark_input(std::size_t n) {
+  if (!n || n > (1u << 26)) throw std::runtime_error("invalid benchmark input size");
   Tensor t{1, n, 4, std::vector<float>(n)};
   std::mt19937 rng(20260909);
   std::normal_distribution<float> normal;
-  for (auto& v : t.values)
-    v = normal(rng);
+  for (auto& v : t.values) v = normal(rng);
+  return t;
+}
+
+// 导出旧基准使用的正态输入；正式测试随后读取文件并由 Python 记录 SHA256。
+void export_benchmark_input(std::size_t n, const std::string& path) {
+  if (std::filesystem::exists(path)) throw std::runtime_error("benchmark input already exists");
+  const auto t = benchmark_input(n);
+  std::ofstream f(path, std::ios::binary);
+  f.write("FP32INP1", 8);
+  write_scalar<std::uint32_t>(f, 1);
+  f.write(reinterpret_cast<const char*>(&t.rows), 8);
+  f.write(reinterpret_cast<const char*>(&t.cols), 8);
+  f.write(reinterpret_cast<const char*>(t.values.data()), n * sizeof(float));
+  if (!f) throw std::runtime_error("failed to export benchmark input");
+}
+
+void benchmark(std::size_t n, int repeats, const std::string& input_file) {
+  if (!n || n > (1u << 26) || repeats < 1 || repeats > 1000)
+    throw std::runtime_error("benchmark: n must be 1..2^26, repeats 1..1000");
+  Tensor t = input_file.empty() ? benchmark_input(n) : read_input(input_file);
+  if (t.element_bytes != 4 || t.rows != 1 || t.cols != n)
+    throw std::runtime_error("benchmark requires FP32 input with shape 1 x elements");
   Options o;
   Workspace w(n, o);
   w.upload(t.values);

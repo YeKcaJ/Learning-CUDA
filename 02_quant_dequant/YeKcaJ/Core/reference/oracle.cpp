@@ -83,6 +83,14 @@ std::vector<float> reference_dequantize(const Packed& q) {
 
 // 同时检查形状、分组、data/scale 字节及 global_scale 的 FP32 位模式。
 void compare_packed(const Packed& a, const Packed& b) {
+  for (std::size_t i = 0; i < std::min(a.scales.size(), b.scales.size()); ++i)
+    if (a.scales[i] != b.scales[i])
+      throw std::runtime_error("scale mismatch at " + std::to_string(i) + ": got=" +
+          std::to_string(a.scales[i]) + " expected=" + std::to_string(b.scales[i]));
+  for (std::size_t i = 0; i < std::min(a.data.size(), b.data.size()); ++i)
+    if (a.data[i] != b.data[i])
+      throw std::runtime_error("data mismatch at " + std::to_string(i) + ": got=" +
+          std::to_string(a.data[i]) + " expected=" + std::to_string(b.data[i]));
   if (a.rows != b.rows || a.cols != b.cols || a.group != b.group ||
       a.data != b.data || a.scales != b.scales || std::memcmp(&a.global, &b.global, 4))
     throw std::runtime_error("pipeline CPU/GPU packed mismatch");

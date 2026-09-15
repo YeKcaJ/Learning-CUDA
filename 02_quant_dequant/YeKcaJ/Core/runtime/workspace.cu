@@ -1,8 +1,12 @@
 // 唯一包含正式 kernel 定义的编译单元；按格式和选项选择执行路径。
 #include "runtime/workspace.cuh"
 #include "kernels/reduce.cuh"
+#ifdef LP_BACKEND_MUSA
+#include "backends/musa/quantize.cuh"
+#else
 #include "kernels/mxfp8_quantize.cuh"
 #include "kernels/nvfp4_quantize.cuh"
+#endif
 #include "kernels/fallback_quantize.cuh"
 #include "kernels/dequantize.cuh"
 
@@ -11,6 +15,17 @@ namespace pipeline {
 void Workspace::launch_quant(bool baseline) {
   if (!n) return;
 
+#ifdef LP_BACKEND_MUSA
+  if (!options.tensor && !options.stochastic && !baseline) {
+    if (nvfp4) {
+      maximum<<<partials, 256>>>(input.ptr, scratch.ptr, n);
+      finalize_max<<<1, 256>>>(scratch.ptr, state.ptr, partials);
+    }
+    musa_quantize_vectorized_kernel<<<static_cast<unsigned>(ceil_div(n, 1024)), 256>>>(
+        input.ptr, data.ptr, scales.ptr, state.ptr, n);
+    return;
+  }
+#else
   if (!nvfp4 && !options.tensor && !options.stochastic && !baseline) {
     // 256 threads / 8 lanes per group = 32 groups = 1024 elements per block。
     mxfp8_quantize_vectorized_kernel<<<static_cast<unsigned>(ceil_div(n, 1024)), 256>>>(
@@ -28,6 +43,7 @@ void Workspace::launch_quant(bool baseline) {
     return;
   }
 
+#endif
   // MXFP8 block 模式只需局部最大值，跳过全张量归约。
   if (nvfp4 || options.tensor) {
     maximum<<<partials, 256>>>(input.ptr, scratch.ptr, n);

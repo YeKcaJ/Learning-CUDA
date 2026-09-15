@@ -1,12 +1,13 @@
 # 核心程序说明
 
-正式程序由一个 Python 配置入口和两个 CUDA 计算后端组成。Core 包含全部源码和冻结参考数据，可以单独复制、重新构建；不要复制旧 build 缓存。
+正式程序由一个 Python 配置入口和两个格式可执行程序组成，编译时选择 CUDA 或 MUSA 后端。Core 包含全部源码和冻结参考数据，可以单独复制、重新构建；不要复制旧 build 缓存。
 这里的文件按职责划分，优化算子主要看 `kernels/`。
 
 ## 1. 目录与调用关系
 
 ```text
 Core/
+├── backends/musa/          MUSA 融合 kernel、运行时名称兼容层及使用说明
 ├── app/                    程序入口和文件任务
 │   ├── main.cpp            分发命令、统一处理异常
 │   ├── commands.h          文件任务、benchmark、自测的接口声明
@@ -46,7 +47,8 @@ Core/
 
 | 路径/配置 | GPU 执行顺序 |
 |---|---|
-| MXFP8 block+nearest | `mxfp8_quantize_fused_kernel` |
+| CUDA MXFP8 block+nearest | `mxfp8_quantize_vectorized_kernel` |
+| MUSA block+nearest | NVFP4 先做全局两级归约，再由 `musa_quantize_vectorized_kernel` 量化；MXFP8 直接向量化融合量化 |
 | NVFP4 block+nearest | `maximum → finalize_max → nvfp4_quantize_fused_kernel` |
 | tensor 或 stochastic | 按需全局归约 → `build_scales` 或 `build_block_scales` → `quantize_kernel<false>` |
 | 内部 baseline | 按需全局归约 → `build_scales → quantize_kernel<true>` |
@@ -111,7 +113,8 @@ cmake --build Core/build -j 4
 ctest --test-dir Core/build --output-on-failure
 ```
 
-8 个 CTest 入口覆盖工具、归约边界、两种格式的文件/类型测试、算法回归与冻结哈希。
+9 个公共 CTest 入口覆盖工具、归约边界、设备算术、两种格式的文件/类型测试、算法回归与冻结哈希。MUSA 额外运行一项 shuffle 测试，共 10 项；算法回归另外用尾部哨兵检查 data、scale 和三种输出的越界写。
+MUSA 的构建、运行和函数说明见 [backends/musa/README.md](backends/musa/README.md)。
 `tests/reduction.cu` 独立检查局部/全局最大值及 global_scale，覆盖 warp 边界、跨步扫描尾部、零和极端有限值。
 也可运行 `./Core/build/pipeline_mxfp8 --self-test` 或 `./Core/build/pipeline_nvfp4 --self-test`。
 冻结文件只验证，不重新生成；关闭 BUILD_TESTING 会去掉算法自测代码，普通文件任务仍有 CPU 对照。
@@ -155,7 +158,7 @@ python3 Core/tools/benchmark.py --directory records/my-before --repeats 20
 ```
 
 固定 FP32 正态输入、block+nearest、预热 3 次，测 1M/4M/16M。查看 RESULTS.md。
-算子优化比较同规模 `quant_optimized / resident_gpu` 的 median、P95、逻辑带宽；反量化按相同输出 dtype 比。
+算子优化使用 `input/benchmark-v1/` 中冻结并校验 SHA256 的 FP32 输入，预热3次、测量20次。比较同规模 `quant_optimized / resident_gpu` 的 median、P95、逻辑带宽；反量化按相同输出 dtype 比。加速比只列相对上一轮和第1轮，完整条件见 [固定协议](../docs/BENCHMARK_PROTOCOL.md)。
 输入读取、FP16 展开、CPU 校验、文件落盘不在驻留 GPU 计时内。单次 run 用于正确性和误差，不用于正式性能结论。
 
 **⑥ 用 nsys 定位阶段**

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__MUSACC__)
 #define LP_HOST_DEVICE __host__ __device__
 #else
 #define LP_HOST_DEVICE

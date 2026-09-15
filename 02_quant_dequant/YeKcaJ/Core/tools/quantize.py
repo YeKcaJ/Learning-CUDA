@@ -18,7 +18,7 @@ PROJECT = ROOT.parent
 
 
 # 自动结果接受 input/<月日>/<编号>.<dtype>，外部输入继续手动指定 --prefix。
-def automatic_prefix(source, cfg):
+def automatic_prefix(source, cfg, backend="cuda"):
     source = Path(source).resolve()
     try:
         relative = source.relative_to((PROJECT / "input").resolve())
@@ -34,7 +34,10 @@ def automatic_prefix(source, cfg):
     with source.open("rb") as stream:
         if stream.read(8) != (b"FP16INP1" if dtype == "fp16" else b"FP32INP1"):
             raise ValueError("input header does not match its dtype directory")
-    directory = PROJECT / "output" / day / Path(filename).stem / cfg["format"]
+    if backend not in ("cuda", "musa"):
+        raise ValueError("backend must be cuda or musa")
+    # CUDA 与 MUSA 使用同一输入时也必须分目录，避免 packed/output/log 互相覆盖。
+    directory = PROJECT / "output" / day / Path(filename).stem / cfg["format"] / backend
     directory.mkdir(parents=True, exist_ok=True)
     # mkdir 独占编号；重复/并发运行不会复用同一个结果目录。
     index = 1
@@ -100,10 +103,12 @@ def read_config(path):
 
 
 # 两种格式分别构建一个 pipeline 程序，Python 不实现量化 kernel。
-def executable(fmt):
-    path = ROOT / "build" / ("pipeline_" + fmt)
+def executable(fmt, backend="cuda"):
+    if backend not in ("cuda", "musa"):
+        raise ValueError("backend must be cuda or musa")
+    path = ROOT / ("build-musa" if backend == "musa" else "build") / ("pipeline_" + fmt)
     if not path.is_file():
-        raise ValueError(f"build the CUDA project first: {path}")
+        raise ValueError(f"build the {backend.upper()} project first: {path}")
     return path
 
 
@@ -188,12 +193,12 @@ def format_summary(record, log):
 
 
 # 生成输出路径 -> 调用 pipeline 做 CPU/GPU 对照 -> 保存 JSON -> 打印摘要。
-def run(cfg, source, prefix=None, console_json=False):
+def run(cfg, source, prefix=None, console_json=False, backend="cuda"):
     source = Path(source).resolve()
-    binary = executable(cfg["format"])
+    binary = executable(cfg["format"], backend)
     source_hash = input_sha256(source)
     automatic = prefix is None
-    prefix = automatic_prefix(source, cfg) if automatic else Path(prefix).resolve()
+    prefix = automatic_prefix(source, cfg, backend) if automatic else Path(prefix).resolve()
     if automatic:
         packed, output, log = (Path(str(prefix) + ".lpq"), Path(str(prefix) + "." + cfg["output_type"]), Path(str(prefix) + ".json"))
     else:
@@ -221,6 +226,7 @@ def run(cfg, source, prefix=None, console_json=False):
     result = subprocess.run(command, text=True, capture_output=True, check=True)
     record = json.loads(result.stdout.splitlines()[-1])
     record.update(
+        backend=backend,
         target_gpu=cfg["target_gpu"], input=str(source), packed=str(packed), output=str(output),
         input_sha256=source_hash, config=dict(cfg),
         created_at=datetime.datetime.now().astimezone().isoformat(),
@@ -295,6 +301,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("run")
+    p.add_argument("--backend", choices=["cuda", "musa"], default="cuda")
     p.add_argument("--config", required=True)
     p.add_argument("--input", required=True)
     p.add_argument("--prefix", help="手动输出前缀；省略时按 input 目录结构自动分配结果")
@@ -307,10 +314,11 @@ def main():
     p.add_argument("--distribution", choices=["uniform", "normal", "outlier"], default="normal")
     p.add_argument("--seed", type=int, default=1234)
     p = commands.add_parser("evaluate")
+    p.add_argument("--backend", choices=["cuda", "musa"], default="cuda")
     p.add_argument("--directory", required=True, help="new output directory")
     args = parser.parse_args()
     if args.command == "run":
-        run(read_config(args.config), args.input, args.prefix, console_json=args.json)
+        run(read_config(args.config), args.input, args.prefix, console_json=args.json, backend=args.backend)
     elif args.command == "generate":
         if args.output:
             generate(args.output, args.rows, args.cols, args.dtype, args.distribution, args.seed)
@@ -339,7 +347,7 @@ def main():
                                     rounding=rounding,
                                     output_type=output,
                                     seed=1234,
-                                    target_gpu="RTX 3060 Laptop",
+                                    target_gpu="unspecified; see benchmark environment",
                                 )
                                 record = run(
                                     cfg,
@@ -347,6 +355,7 @@ def main():
                                     directory
                                     / f"{distribution}_{dtype}_{fmt}_{mode}_{rounding}_{output}",
                                     console_json=True,
+                                    backend=args.backend,
                                 )
                                 records.append(dict(record, distribution=distribution))
         (directory / "summary.json").write_text(

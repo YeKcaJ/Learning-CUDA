@@ -27,7 +27,7 @@
 
 ## 格式与数学过程
 
-详细字段和舍入规则分别见 [冻结 v1 规范](REFERENCE_SPEC.md) 与 [扩展 v2 规范](EXTENDED_SPEC.md)。
+详细字段和舍入规则见 [冻结 v1 规范](REFERENCE_SPEC.md)。
 默认块边界按矩阵行主序展平后划分，不按每行重新开始。
 
 MXFP8 每组求最大绝对值 m，用 `e=clamp(ceil(log2(m/448))+127,0,254)` 保存 E8M0 指数，
