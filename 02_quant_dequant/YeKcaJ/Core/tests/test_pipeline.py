@@ -152,8 +152,9 @@ class PipelineTests(unittest.TestCase):
             source = quantize.generate_automatic(1, 33, "fp16", "outlier", 42)
             first = run(cfg, source)
             second = run(cfg, source)
-            self.assertTrue(Path(first["packed"]).name.startswith("fp16_bf16"))
-            self.assertTrue(Path(second["packed"]).name.startswith("fp16_bf16_2"))
+            stem = "fp16_" + cfg["output_type"]
+            self.assertEqual(Path(first["packed"]).name, stem + ".lpq")
+            self.assertEqual(Path(second["packed"]).name, stem + "_2.lpq")
             self.assertEqual(Path(first["packed"]).read_bytes(), Path(second["packed"]).read_bytes())
             self.assertEqual(first["config"], cfg)
             self.assertEqual(first["input_sha256"], quantize.input_sha256(source))

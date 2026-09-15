@@ -56,5 +56,5 @@
   "C_Cpp_Runner.showCompilationTime": false,
   "C_Cpp_Runner.useLinkTimeOptimization": false,
   "C_Cpp_Runner.msvcSecureNoWarnings": false,
-  "cmake.sourceDirectory": "/wsl.localhost/Ubuntu/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/CPUMXFP8"
+  "cmake.sourceDirectory": "/wsl.localhost/Ubuntu/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/Core"
 }

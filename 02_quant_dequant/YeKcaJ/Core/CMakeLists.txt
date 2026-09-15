@@ -15,6 +15,11 @@ if(BUILD_TESTING)
   find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
   find_program(SHA256SUM_EXECUTABLE NAMES sha256sum REQUIRED)
   add_test(NAME core_tools COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tools.py)
+  add_executable(reduction_test tests/reduction.cu)
+  target_include_directories(reduction_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(reduction_test PRIVATE TEST_NVFP4)
+  target_compile_options(reduction_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  add_test(NAME core_reduction COMMAND reduction_test)
 endif()
 
 # 每个模块独立编译；只有 runtime/workspace.cu 包含正式 kernel 定义。

@@ -24,7 +24,9 @@ struct Workspace {
       : n(count),
         group(o.tensor ? std::max<std::size_t>(1, n) : o.block),
         groups(ceil_div(n, group)),
-        partials(static_cast<unsigned>(std::min<std::size_t>(4096, ceil_div(n, 256)))),
+        // 归约块上限从 4096 降到 1024；每个线程多做几次 grid-stride 扫描，
+        // 保持 block 内分工和最大值结果不变，同时减少 partial/finalize 的调度负担。
+        partials(static_cast<unsigned>(std::min<std::size_t>(1024, ceil_div(n, 256)))),
         options(o),
         input(n),
         scratch(partials),

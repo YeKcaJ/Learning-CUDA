@@ -1,6 +1,8 @@
 **/build/
 **/__pycache__/
 legacy/build-cache/
+records/06-warp-reduction/before/pipeline_mxfp8
+records/06-warp-reduction/before/pipeline_nvfp4
 input/**/*.fp32
 input/**/*.fp16
 profiles/*.nsys-rep

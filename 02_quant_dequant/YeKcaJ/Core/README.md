@@ -63,6 +63,7 @@ FP16 文件先在 CPU 精确展开为 FP32，再上传；这不是直接读取 F
 | [kernels/nvfp4_quantize.cuh](kernels/nvfp4_quantize.cuh) | `nvfp4_quantize_fused_kernel` | 每线程两个元素、每 8 lane 一个分组；算 E4M3 scale，再编码/打包两个 E2M1 |
 | [kernels/dequantize.cuh](kernels/dequantize.cuh) | `dequantize_kernel<T>` | 解码数据、乘有效 scale，转换到 T；NVFP4 提取对应高/低 nibble |
 | [kernels/reduce.cuh](kernels/reduce.cuh) | `maximum` / `finalize_max` | 生成局部最大值，再归约为张量最大值并计算 NVFP4 global_scale |
+| 同上 | `block_maximum` | 固定 256 线程块，warp 内归约后合并 8 个最大值，仅一次整块同步 |
 | [kernels/scale.cuh](kernels/scale.cuh) | `scale_code` / `effective` | 编码 scale 字节；恢复两种格式的实际乘数 |
 | [kernels/codec.cuh](kernels/codec.cuh) | `encode_e4m3_nearest` | 用 FP32 指数/尾数直接生成 E4M3；中点向较小幅值，不是 nearest-even |
 | 同上 | `encode` | 分发快速 nearest、随机舍入、内部枚举；E2M1 nearest 使用固定中点比较 |
@@ -110,7 +111,8 @@ cmake --build Core/build -j 4
 ctest --test-dir Core/build --output-on-failure
 ```
 
-7 个 CTest 入口覆盖工具、两种格式的文件/类型测试、算法回归与冻结哈希。
+8 个 CTest 入口覆盖工具、归约边界、两种格式的文件/类型测试、算法回归与冻结哈希。
+`tests/reduction.cu` 独立检查局部/全局最大值及 global_scale，覆盖 warp 边界、跨步扫描尾部、零和极端有限值。
 也可运行 `./Core/build/pipeline_mxfp8 --self-test` 或 `./Core/build/pipeline_nvfp4 --self-test`。
 冻结文件只验证，不重新生成；关闭 BUILD_TESTING 会去掉算法自测代码，普通文件任务仍有 CPU 对照。
 
@@ -120,7 +122,7 @@ ctest --test-dir Core/build --output-on-failure
 python3 Core/tools/quantize.py generate --dtype fp32 --rows 1024 --cols 1024
 ```
 
-支持 `--dtype fp16`。自动保存到 `input/<dtype>/<月日>/<编号>.<dtype>`，同时写清单；记下终端打印的实际路径。
+支持 `--dtype fp16`。自动保存到 `input/<月日>/<编号>.<dtype>`，同一编号可同时存在 `.fp16` 和 `.fp32`；同时写清单，记下终端打印的实际路径。
 
 **③ 配置并运行**
 
@@ -128,12 +130,12 @@ python3 Core/tools/quantize.py generate --dtype fp32 --rows 1024 --cols 1024
 
 ```bash
 python3 Core/tools/quantize.py run --config Core/configs/mxfp8.toml \
-  --input input/fp32/911/1.fp32
+  --input input/914/1.fp32
 python3 Core/tools/quantize.py run --config Core/configs/nvfp4.toml \
-  --input input/fp32/911/1.fp32
+  --input input/914/1.fp32
 ```
 
-替换示例日期和编号。输出在 `output/fp32/911/1/<格式>/run-N/`，分为 `weights/result.lpq`、`tensors/result.<output_type>` 和 `logs/result.json` 三类。
+替换示例日期和编号。输出在 `output/914/1/<格式>/`，首次运行生成 `fp32_fp16.lpq`、`fp32_fp16.fp16` 和 `fp32_fp16.json`，重复运行追加 `_2`。
 重复执行增加 run 编号。外部输入使用 `--prefix` 指定新的输出前缀。
 
 **④ 独立反量化已有权重**

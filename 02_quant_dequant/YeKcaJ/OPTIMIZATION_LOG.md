@@ -141,3 +141,74 @@ nsys 验证（4M，`--benchmark` 含预热与 baseline 对照，故实例数多�
 
 结论：保留；NVFP4 量化提升 2.24x/3.17x/3.36x，MXFP8 未回退。
 数据：[benchmark](records/04-nvfp4-e4m3-scale-fused/benchmark/RESULTS.md)。
+
+## 第 3 次：NVFP4 全局归约减少同步（2026-09-14）
+
+改动：`Core/kernels/reduce.cuh` 的两个归约 kernel 改用 warp 归约，再合并 8 个 warp 结果；整块同步由 9 次减为 1 次，共享内存由 256 个 float 减为 8 个。读取方式、global_scale 公式、编码与舍入不变。MXFP8 默认 block 路径不使用这两个 kernel，tensor 路径共用改动。
+
+条件：RTX 3060 Laptop，FP32，block/nearest，预热 3 次、计时 20 次；NVFP4 完整驻留量化序列，单位 ms。
+
+| 元素数 | 本轮前 median | 本轮后 median | 本轮后 P95 | 本轮加速比 | 相对第一轮加速比 | 相对第 0 次累计加速比 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1M | 0.063488 | 0.048128 | 0.049056 | 1.32x | 1.32x | 2.96x |
+| 4M | 0.145856 | 0.140288 | 0.148480 | 1.04x | 1.01x | 3.21x |
+| 16M | 0.520064 | 0.518144 | 0.534528 | 1.00x | 1.00x | 3.36x |
+
+加速比 = 对应基准中位数 / 本轮后中位数。“第一轮”指 NVFP4 首轮优化完成后的结果（本日志第 2 次“步骤2 后”：0.063488 / 0.142336 / 0.519136 ms）；第 0 次基准为 0.142336 / 0.450944 / 1.742800 ms。本轮前为重新实测，因此与第一轮记录略有差异；相对第一轮和第 0 次均为跨次测量对比。
+
+nsys（4M）：`maximum` 中位数 0.062131 → 0.056339 ms，`finalize_max` 0.003456 → 0.003217 ms。
+交换顺序复测：1M 减少 25.9%，4M 减少 3.2%；16M 反而增加约 0.6%，后 P95 为 0.795648 ms，因此不声称 16M 有收益或尾延迟改善。
+正确性：8/8 核心测试通过；新增 220 组归约边界测试；归约专项及两种格式自测的 memcheck/racecheck/synccheck 全部 0 错误，memcheck 无泄漏。
+结论：保留，收益主要在 NVFP4 小中规模量化；MXFP8 默认量化与反量化算子不变。
+数据：[优化前](records/06-warp-reduction/before/benchmark/RESULTS.md)、[优化后](records/06-warp-reduction/after/benchmark/RESULTS.md)、[复测](records/06-warp-reduction/repeat/summary.json)、[验证](records/06-warp-reduction/VALIDATION.md)。
+
+## 第 4 次：MXFP8 向量化加载与打包写回（2026-09-14）
+
+改动：新增 `mxfp8_quantize_vectorized_kernel`。每个线程读取 4 个连续 FP32，使用 `float4` 加载并将 4 个 E4M3 结果合并为一次 32-bit 写入；8 个线程共同处理一个 32 元素 scale 分组。尾部不足 4 个元素时回退标量读取。scale 计算、舍入和输出格式不变。
+
+条件：RTX 3060 Laptop，FP32，block/nearest，预热 3 次、计时 20 次；单位 ms，`resident_gpu` 中位数。
+
+| 元素数 | 第 1 次后 | 本轮后 | 本轮 P95 | 相对第 1 次加速比 |
+|---:|---:|---:|---:|---:|
+| 1M | 0.034816 | 0.025600 | 0.094080 | 1.36x |
+| 4M | 0.123312 | 0.070656 | 0.073728 | 1.74x |
+| 16M | 0.435648 | 0.269824 | 0.279552 | 1.61x |
+
+正确性：MXFP8 回归、冻结哈希、IO 测试均通过；`--self-test` 的 299 个 pipeline cases 通过。NVFP4 路径未改动，仅作为同批次运行对照。
+
+结论：当前中位数显示向量化版本有效，4M/16M 收益较稳定；1M 的 P95 受启动噪声影响，需后续 nsys/重复采样确认尾延迟。数据：[benchmark](records/07-mxfp8-vectorized/RESULTS.md)。
+
+## 第 5 次实验：workspace 复用对照（2026-09-14）
+
+新增 `quant_reused_workspace / host_api`：复用现有 Workspace 的显存和 event，仍计入上传、量化、下载及主机结果分配/释放。与每次新建的 `quant_optimized / host_api` 交替测量；各预热 3 次、计时 20 次，FP32 block/nearest。此轮仅新增基准对照，kernel 和单次文件 CLI 未改变。
+
+| 格式 | 元素数 | 每次新建 median ms | 复用 median ms | 加速比 |
+|---|---:|---:|---:|---:|
+| MXFP8 | 1M | 2.171398 | 1.037373 | 2.09x |
+| MXFP8 | 4M | 4.777892 | 2.792794 | 1.71x |
+| MXFP8 | 16M | 16.660836 | 11.450560 | 1.46x |
+| NVFP4 | 1M | 1.746878 | 0.963798 | 1.81x |
+| NVFP4 | 4M | 4.598268 | 2.726448 | 1.69x |
+| NVFP4 | 16M | 14.593807 | 9.878531 | 1.48x |
+
+复测：4M 的 MXFP8/NVFP4 分别为 1.71x/1.70x，16M 均约 1.48x；1M 收益存在但幅度有波动。各规模两轮 P95 均下降。8/8 核心测试通过，两轮基准均通过复用结果的完整 packed 比较。
+
+结论：复用对同进程重复调用有效，不代表单次 CLI 或 kernel 本身获得相同加速；首次创建和最终释放不计入复用耗时。正式批量入口尚未实现。
+数据：[首轮](records/10-workspace-reuse/benchmark/RESULTS.md)、[复测](records/10-workspace-reuse/repeat/RESULTS.md)。
+
+## 第 6 次：NVFP4 全局归约 partial 数量调优（2026-09-14）
+
+改动：将 `maximum`/`finalize_max` 使用的 partial block 上限从 4096 降为 1024。每个线程通过原有 grid-stride loop 扫描更多输入，partial 的分段规则和最大值结果保持不变；没有改变 scale 公式或编码。
+
+| 元素数 | 原实现 median ms | partial=1024 median ms | 加速比 |
+|---:|---:|---:|---:|
+| 1M | 0.048928 | 0.041344 | 1.18x |
+| 4M | 0.143360 | 0.140224 | 1.02x |
+| 16M | 0.522144 | 0.518656 | 1.01x |
+
+复测结果：1M 为 0.041344 ms，4M 为 0.140224 ms，16M 为 0.518656 ms。Nsight Compute 的 4M `maximum` kernel 为 60.83 us，原实现为 61.31 us，说明主要收益来自减少小规模 kernel 调度/归约开销，大规模访存阶段仍接近带宽上限。
+
+正确性：8/8 核心测试通过，归约边界测试通过；曾尝试直接将 maximum 改成连续 `float4` 加载，但会改变 partial 分段并被 `n=257` 专项测试捕获，已撤销该方案。
+
+结论：保留 partial=1024；收益主要在 1M，小规模和大规模均无明显回退。NVFP4 融合量化的计算受限部分尚未改变。
+数据：[首轮](records/11-nvfp4-partials1024/RESULTS.md)、[复测](records/11-nvfp4-partials1024/repeat/RESULTS.md)、[NCU](results/ncu/nvfp4-maximum-1024.ncu-rep)。

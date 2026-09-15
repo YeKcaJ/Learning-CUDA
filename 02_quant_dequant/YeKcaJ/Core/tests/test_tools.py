@@ -29,11 +29,11 @@ class ToolTests(unittest.TestCase):
             original = first.read_bytes()
             second = tool.generate_automatic(1, 33, "fp16", "normal", 1234)
             fp32 = tool.generate_automatic(1, 33, "fp32", "normal", 1234)
-            self.assertEqual(first.relative_to(folder).as_posix(), "input/fp16/910/1.fp16")
+            self.assertEqual(first.relative_to(folder).as_posix(), "input/910/1.fp16")
             self.assertEqual(second.name, "2.fp16")
             self.assertEqual(fp32.name, "1.fp32")
             self.assertEqual(original, second.read_bytes())
-            metadata = json.loads(first.with_suffix(".json").read_text())
+            metadata = json.loads(first.with_name(first.name + ".json").read_text())
             self.assertEqual(metadata["input_sha256"], tool.input_sha256(first))
             self.assertEqual(metadata["seed"], 1234)
             cfg = {"format": "nvfp4", "output_type": "fp32"}

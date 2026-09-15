@@ -21,7 +21,7 @@
 ```text
 YeKcaJ/
 ├── Core/                  正式源码、配置、CPU reference 与测试
-├── input/                 输入：fp16或fp32 / 月日 / 编号
+├── input/                 输入：月日 / 编号.fp16或.fp32
 ├── output/                分为 weights、tensors、logs 的运行输出
 ├── records/               性能实验、nsys 和验证证据
 ├── docs/                  题目 PDF、文件规范、阶段报告
@@ -47,7 +47,7 @@ ctest --test-dir Core/build --output-on-failure
 ```bash
 python3 Core/tools/quantize.py generate --dtype fp16 --rows 128 --cols 129
 python3 Core/tools/quantize.py run --config Core/configs/mxfp8.toml \
-  --input input/fp16/911/1.fp16
+  --input input/914/1.fp16
 ```
 
 输入路径请替换成 generate 实际打印的路径。修改配置中的 `output_type` 选择 fp32/fp16/bf16。

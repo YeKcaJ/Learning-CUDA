@@ -12,7 +12,8 @@ void Workspace::launch_quant(bool baseline) {
   if (!n) return;
 
   if (!nvfp4 && !options.tensor && !options.stochastic && !baseline) {
-    mxfp8_quantize_fused_kernel<<<static_cast<unsigned>(ceil_div(n, 256)), 256>>>(
+    // 256 threads / 8 lanes per group = 32 groups = 1024 elements per block。
+    mxfp8_quantize_vectorized_kernel<<<static_cast<unsigned>(ceil_div(n, 1024)), 256>>>(
         input.ptr, data.ptr, scales.ptr, n);
     return;
   }

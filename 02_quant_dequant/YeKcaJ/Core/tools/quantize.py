@@ -17,16 +17,17 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT.parent
 
 
-# 自动结果只接受 input/<dtype>/<月日>/<name>，外部输入继续手动指定 --prefix。
+# 自动结果接受 input/<月日>/<编号>.<dtype>，外部输入继续手动指定 --prefix。
 def automatic_prefix(source, cfg):
     source = Path(source).resolve()
     try:
         relative = source.relative_to((PROJECT / "input").resolve())
     except ValueError:
         raise ValueError("external input requires --prefix; automatic paths use project input/")
-    if len(relative.parts) != 3 or relative.parts[0] not in ("fp16", "fp32"):
-        raise ValueError("automatic input layout must be input/fp16|fp32/monthday/name")
-    dtype, day, filename = relative.parts
+    if len(relative.parts) != 2 or relative.suffix.lstrip(".") not in ("fp16", "fp32"):
+        raise ValueError("automatic input layout must be input/monthday/number.fp16|fp32")
+    day, filename = relative.parts
+    dtype = relative.suffix.lstrip(".")
     if len(day) not in (3, 4) or not day.isascii() or not day.isdigit() or source.suffix != "." + dtype:
         raise ValueError("automatic input date or dtype suffix is invalid")
     datetime.datetime(2000, int(day[:-2]), int(day[-2:]))
@@ -37,7 +38,7 @@ def automatic_prefix(source, cfg):
     directory.mkdir(parents=True, exist_ok=True)
     # mkdir 独占编号；重复/并发运行不会复用同一个结果目录。
     index = 1
-    stem = f"{dtype}_{cfg['output_type']}"
+    stem = f"{dtype}_{cfg.get('output_type', 'fp32')}"
     while True:
         suffix = "" if index == 1 else f"_{index}"
         prefix = directory / (stem + suffix)
@@ -235,12 +236,13 @@ def run(cfg, source, prefix=None, console_json=False):
 # 自动生成 input/<dtype>/<月日>/<编号>，并写旁边的生成参数清单。
 def generate_automatic(rows, cols, dtype, distribution, seed):
     today = datetime.date.today()
-    directory = PROJECT / "input" / dtype / f"{today.month}{today.day:02d}"
+    directory = PROJECT / "input" / f"{today.month}{today.day:02d}"
     directory.mkdir(parents=True, exist_ok=True)
     index = 1
     while True:
         path = directory / f"{index}.{dtype}"
-        manifest = path.with_suffix(".json")
+        # 清单也带 dtype，避免 1.fp16 与 1.fp32 争用同一个 1.json。
+        manifest = path.with_name(path.name + ".json")
         if path.exists() or manifest.exists():
             index += 1
             continue

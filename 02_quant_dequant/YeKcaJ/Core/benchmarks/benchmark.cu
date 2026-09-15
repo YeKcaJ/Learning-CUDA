@@ -80,9 +80,11 @@ void benchmark(std::size_t n, int repeats) {
   bench_dequant<float>(w, repeats);
   bench_dequant<__half>(w, repeats);
   bench_dequant<__nv_bfloat16>(w, repeats);
-  // 单次完整量化调用包括申请/释放与传输；与驻留 GPU 指标分开记录。
-  std::vector<double> wall;
-  for (int i = -3; i < repeats; ++i) {
+  // 两条 host 路径均包含上传、量化、下载和主机结果分配/释放。
+  // reused 在计时外申请显存和 event；交替测量顺序，减少时钟漂移的影响。
+  Workspace reused(n, o);
+  std::vector<double> wall, reused_wall;
+  auto fresh_call = [&] {
     const auto start = Clock::now();
     {
       Workspace fresh(n, o);
@@ -92,10 +94,37 @@ void benchmark(std::size_t n, int repeats) {
       if (result.data.size() != data_size(n))
         throw std::runtime_error("bad result");
     }
-    if (i >= 0)
-      wall.push_back(elapsed(start));
+    return elapsed(start);
+  };
+  auto reused_call = [&] {
+    const auto start = Clock::now();
+    {
+      reused.upload(t.values);
+      reused.events.measure([&] { reused.launch_quant(); });
+      auto result = reused.download(t);
+      if (result.data.size() != data_size(n))
+        throw std::runtime_error("bad reused result");
+    }
+    return elapsed(start);
+  };
+  for (int i = -3; i < repeats; ++i) {
+    double fresh_ms, reused_ms;
+    if (i % 2) {
+      reused_ms = reused_call();
+      fresh_ms = fresh_call();
+    } else {
+      fresh_ms = fresh_call();
+      reused_ms = reused_call();
+    }
+    if (i >= 0) {
+      wall.push_back(fresh_ms);
+      reused_wall.push_back(reused_ms);
+    }
   }
   stats("quant_optimized", "host_api", n, wall, bytes);
+  stats("quant_reused_workspace", "host_api", n, reused_wall, bytes);
+  // 完整 packed 比较放在计时外，包含 scale 和 NVFP4 global_scale。
+  compare_packed(q, reused.download(t));
   // CPU 对照使用冻结的枚举编码规则，仅在 1M 预跑一次、计时三次。
   if (n == (1u << 20)) {
     auto cpu = reference_quantize(t, o);
