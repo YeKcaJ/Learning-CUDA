@@ -21,7 +21,7 @@ input/benchmark-v1/                  固定性能输入，只放 normal_N.fp32 �
 input/evaluation-v1/                 固定误差评估输入：uniform、normal、outlier
 ```
 
-误差评估的最终结果放到 `output/evaluation-v1/<backend>/`，不把最终输出混进 `records/`。
+误差评估的最终结果放到 `output/evaluation-v1/<backend>/`，只保留 `uniform.json`、`normal.json`、`outlier.json` 和 `summary.json`；144 组组合的中间文件使用临时目录，不把最终输出混进 `records/`。
 
 ## `records/`：过程证据
 

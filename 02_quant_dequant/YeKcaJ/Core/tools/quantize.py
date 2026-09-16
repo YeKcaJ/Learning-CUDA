@@ -11,6 +11,7 @@ import random
 import struct
 import subprocess
 import tomllib
+import tempfile
 import unicodedata
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -349,18 +350,21 @@ def main():
                                     seed=1234,
                                     target_gpu="unspecified; see benchmark environment",
                                 )
-                                record = run(
-                                    cfg,
-                                    source,
-                                    directory
-                                    / f"{distribution}_{dtype}_{fmt}_{mode}_{rounding}_{output}",
-                                    console_json=True,
-                                    backend=args.backend,
-                                )
+                                # 中间 packed/反量化文件只在临时目录生成，最终 output 只保留三类统计。
+                                with tempfile.TemporaryDirectory(prefix="lp-eval-") as temp:
+                                    record = run(
+                                        cfg, source,
+                                        Path(temp) / f"{distribution}_{dtype}_{fmt}_{mode}_{rounding}_{output}",
+                                        console_json=True, backend=args.backend,
+                                    )
                                 records.append(dict(record, distribution=distribution))
-        (directory / "summary.json").write_text(
-            json.dumps(records, indent=2) + "\n", encoding="utf-8"
-        )
+        # 每种分布一个统计文件，完整组合明细保留在 records 中，不污染最终 output。
+        for distribution in ("uniform", "normal", "outlier"):
+            selected = [r for r in records if r["distribution"] == distribution]
+            (directory / f"{distribution}.json").write_text(
+                json.dumps(selected, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        (directory / "summary.json").write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
