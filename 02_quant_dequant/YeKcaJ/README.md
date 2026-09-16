@@ -23,7 +23,7 @@
 YeKcaJ/
 ├── Core/                  正式源码、配置、CPU reference 与测试
 ├── input/                 输入：月日 / 编号.fp16或.fp32
-├── output/                月日/输入编号/量化格式/，三类结果共用文件名前缀
+├── output/                最终交付文件：月日/输入编号/格式/backend/
 ├── records/               性能实验、nsys 和验证证据
 ├── docs/                  题目 PDF、文件规范、阶段报告
 ├── legacy/                旧实现与旧入口存档，不参与正式构建
@@ -52,7 +52,7 @@ python3 Core/tools/quantize.py run --config Core/configs/mxfp8.toml \
 ```
 
 输入路径请替换成 generate 实际打印的路径。修改配置中的 `output_type` 选择 fp32/fp16/bf16。
-输出自动保存为 `output/<月日>/<输入编号>/<量化格式>/fp32_fp16.{lpq,fp16,json}`（以 FP32 → FP16 为例），依次为 packed 权重、反量化张量和 JSON 日志；重复运行追加 `_2` 等编号。
+输出自动保存为 `output/<月日>/<输入编号>/<量化格式>/<backend>/fp32_fp16.{lpq,fp16,json}`（以 FP32 → FP16 为例）；CUDA 和 MUSA 分开保存。目录详情见 [输出布局](docs/OUTPUT_LAYOUT.md)。
 输入文件带格式和尺寸头，不能直接把无头原始数组改扩展名使用。
 
 摩尔线程服务器使用独立构建目录：
@@ -81,6 +81,6 @@ nsys 默认量化看 `mxfp8_quantize_fused_kernel` 或 `nvfp4_quantize_fused_ker
 `quant_enumeration` 是内部对照，不能替代已保存的优化前版本。
 
 规范：[冻结 v1](docs/REFERENCE_SPEC.md)。
-最新优化见 [优化日志](OPTIMIZATION_LOG.md)；[阶段报告](docs/FINAL_REPORT.md) 保留原测量日期。
+最新优化见 [优化日志](OPTIMIZATION_LOG.md)；[阶段报告](docs/FINAL_REPORT.md) 保留原测量日期。输入、输出和 records 职责见 [输出布局](docs/OUTPUT_LAYOUT.md)。
 摩尔线程的优化与 CUDA 分开记录，见 [MUSA 优化日志](docs/MUSA_OPTIMIZATION_LOG.md)。
 旧路径迁移说明见 [legacy/README.md](legacy/README.md)。提交源码时排除 build 和可重建产物；构建 Core 不需要 legacy。
