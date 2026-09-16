@@ -24,7 +24,7 @@
 - 只用 `input/benchmark-v1/` 的冻结 FP32 输入，并校验 SHA256
 - 固定 `block + nearest`、1M/4M/16M、预热 3 次、测量 20 次
 - 只比较 `quant_optimized / resident_gpu` 的中位数与 P95
-- **加速比只有两列**：相对上一轮、相对本格式第 1 轮
+- **加速比只有两列**：相对上一轮、相对本平台本格式的优化前基线
 
 还说明了冻结输入不在版本库里时如何用 `--benchmark-export` 重建。
 
