@@ -46,11 +46,4 @@ CUDA 历史日志保留原第0～6次编号和第0次基准表，不重新编号
 
 生成历史表：`python3 Core/tools/optimization_report.py`。
 
-严格跨平台比较：
-
-```bash
-python3 Core/tools/compare_benchmarks.py records/controlled-v1/cuda \
-  records/controlled-v1/musa --output docs/CONTROLLED_COMPARISON.md
-```
-
-硬件不同，因此跨平台耗时比独立于优化链，不能写成算法优化加速比，也不用历史最低值冒充当前版本。
+严格跨平台比较使用 `Core/tools/compare_benchmarks.py`，报告直接保存到指定的 `records/controlled-v1/` 目录；硬件不同，因此跨平台耗时比独立于优化链，不能写成算法优化加速比，也不用历史最低值冒充当前版本。

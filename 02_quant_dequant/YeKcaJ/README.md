@@ -82,6 +82,5 @@ nsys 默认量化看 `mxfp8_quantize_fused_kernel` 或 `nvfp4_quantize_fused_ker
 
 规范：[冻结 v1](docs/REFERENCE_SPEC.md)。
 最新优化见 [优化日志](OPTIMIZATION_LOG.md)；[阶段报告](docs/FINAL_REPORT.md) 保留原测量日期。
-两种格式的输入、指标、nsys依据和整体性能对照见 [CUDA 优化总对比](docs/CUDA_OPTIMIZATION_SUMMARY.md)。
 摩尔线程的优化与 CUDA 分开记录，见 [MUSA 优化日志](docs/MUSA_OPTIMIZATION_LOG.md)。
 旧路径迁移说明见 [legacy/README.md](legacy/README.md)。提交源码时排除 build 和可重建产物；构建 Core 不需要 legacy。
