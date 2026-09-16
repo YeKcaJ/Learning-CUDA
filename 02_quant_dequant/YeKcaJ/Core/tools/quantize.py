@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 import random
+import shutil
 import struct
 import subprocess
 import tomllib
@@ -40,7 +41,7 @@ def automatic_prefix(source, cfg, backend="cuda"):
     # CUDA 与 MUSA 使用同一输入时也必须分目录，避免 packed/output/log 互相覆盖。
     directory = PROJECT / "output" / day / Path(filename).stem / cfg["format"] / backend
     directory.mkdir(parents=True, exist_ok=True)
-    # mkdir 独占编号；重复/并发运行不会复用同一个结果目录。
+    # 顺序重复运行时选择未使用的文件名前缀。
     index = 1
     stem = f"{dtype}_{cfg.get('output_type', 'fp32')}"
     while True:
@@ -194,7 +195,7 @@ def format_summary(record, log):
 
 
 # 生成输出路径 -> 调用 pipeline 做 CPU/GPU 对照 -> 保存 JSON -> 打印摘要。
-def run(cfg, source, prefix=None, console_json=False, backend="cuda"):
+def run(cfg, source, prefix=None, console_json=False, backend="cuda", quiet=False):
     source = Path(source).resolve()
     binary = executable(cfg["format"], backend)
     source_hash = input_sha256(source)
@@ -233,14 +234,15 @@ def run(cfg, source, prefix=None, console_json=False, backend="cuda"):
         created_at=datetime.datetime.now().astimezone().isoformat(),
     )
     log.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(record, ensure_ascii=False) if console_json else format_summary(record, log))
+    if not quiet:
+        print(json.dumps(record, ensure_ascii=False) if console_json else format_summary(record, log))
     return record
 
 
 # ===== 3. 固定种子输入生成 =====
 
 
-# 自动生成 input/<dtype>/<月日>/<编号>，并写旁边的生成参数清单。
+# 自动生成 input/<月日>/<编号>.<dtype>，并写旁边的生成参数清单。
 def generate_automatic(rows, cols, dtype, distribution, seed):
     today = datetime.date.today()
     directory = PROJECT / "input" / f"{today.month}{today.day:02d}"
@@ -296,6 +298,110 @@ def generate(path, rows, cols, dtype, distribution, seed):
 
 # ===== 4. 命令入口与批量误差评估 =====
 
+def write_json(path, value):
+    # 同目录替换，避免中断时留下半个 JSON 文件。
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def prepare_evaluation_inputs(directory):
+    """生成或复用六份固定输入；已有文件和清单必须匹配固定生成规则。"""
+    directory = Path(directory).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest_path = directory / "manifest.json"
+    with tempfile.TemporaryDirectory(prefix="lp-eval-input-") as temp:
+        candidates = Path(temp)
+        hashes = {}
+        for dtype in ("fp32", "fp16"):
+            for distribution in ("uniform", "normal", "outlier"):
+                name = f"{distribution}.{dtype}"
+                generate(candidates / name, 128, 129, dtype, distribution, 1234)
+                hashes[name] = input_sha256(candidates / name)
+        manifest = dict(format_version=1, rows=128, cols=129, seed=1234,
+                        distributions=dict(uniform="U(-3,3)", normal="N(0,1)",
+                                           outlier="N(0,1), first=1000, last=-1000"), sha256=hashes)
+        if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
+            raise ValueError("evaluation-v1 manifest differs from fixed generation rules")
+        # 先检查全部文件，再补齐缺失文件；绝不覆盖被修改的输入。
+        for name, digest in hashes.items():
+            path = directory / name
+            if path.exists() and input_sha256(path) != digest:
+                raise ValueError(f"evaluation input SHA256 mismatch: {path}")
+        for name in hashes:
+            path = directory / name
+            if not path.exists():
+                with (candidates / name).open("rb") as src, path.open("xb") as dst:
+                    shutil.copyfileobj(src, dst)
+        if not manifest_path.exists():
+            write_json(manifest_path, manifest)
+    return directory, manifest
+
+
+def evaluate(backend, directory=None, input_directory=None):
+    for fmt in ("mxfp8", "nvfp4"):
+        executable(fmt, backend)
+    inputs, manifest = prepare_evaluation_inputs(input_directory or PROJECT / "input/evaluation-v1")
+    if directory is not None:
+        directory = Path(directory).resolve()
+        directory.mkdir(parents=True, exist_ok=False)
+    else:
+        parent = PROJECT / "output/evaluation-v1"
+        parent.mkdir(parents=True, exist_ok=True)
+        index = 1
+        while True:
+            directory = parent / (backend if index == 1 else f"{backend}-{index}")
+            try:
+                directory.mkdir()
+                break
+            except FileExistsError:
+                index += 1
+    records = []
+    status = dict(backend=backend, state="running", completed=0, expected=144,
+                  input_directory=str(inputs), input_sha256=manifest["sha256"])
+
+    def checkpoint():
+        for distribution in ("uniform", "normal", "outlier"):
+            write_json(directory / f"{distribution}.json",
+                       [r for r in records if r["distribution"] == distribution])
+        write_json(directory / "summary.json", records)
+        status["completed"] = len(records)
+        write_json(directory / "status.json", status)
+
+    checkpoint()
+    print(f"评估输入: {inputs}\n评估输出: {directory}", flush=True)
+    try:
+        for dtype in ("fp32", "fp16"):
+            for distribution in ("uniform", "normal", "outlier"):
+                source = inputs / f"{distribution}.{dtype}"
+                for fmt in ("mxfp8", "nvfp4"):
+                    for mode in ("block", "tensor"):
+                        for rounding in ("nearest", "stochastic"):
+                            for output in ("fp32", "fp16", "bf16"):
+                                cfg = dict(format=fmt, block_size=32 if fmt == "mxfp8" else 16,
+                                           scale_mode=mode, output_type=output, rounding=rounding,
+                                           seed=1234, target_gpu="unspecified; see benchmark environment")
+                                prefix = directory / distribution / fmt / f"{dtype}_{output}_{mode}_{rounding}"
+                                record = run(cfg, source, prefix, backend=backend, quiet=True)
+                                record["distribution"] = distribution
+                                if record["input_sha256"] != manifest["sha256"][source.name]:
+                                    raise ValueError(f"evaluation input changed: {source}")
+                                write_json(Path(str(prefix) + ".json"), record)
+                                records.append(record)
+                                checkpoint()
+                print(f"已完成 {len(records)}/144: {distribution} {dtype}", flush=True)
+        for name, digest in manifest["sha256"].items():
+            if input_sha256(inputs / name) != digest:
+                raise ValueError(f"evaluation input changed: {name}")
+    except (Exception, KeyboardInterrupt) as exc:
+        status.update(state="failed", error=str(exc) or type(exc).__name__)
+        checkpoint()
+        raise
+    status["state"] = "complete"
+    checkpoint()
+    print(f"评估完成: 144/144；汇总: {directory / 'summary.json'}", flush=True)
+    return directory
+
 
 # run 执行一个配置；generate 生成输入；evaluate 穷举配置并保存评估结果。
 def main():
@@ -308,7 +414,7 @@ def main():
     p.add_argument("--prefix", help="手动输出前缀；省略时按 input 目录结构自动分配结果")
     p.add_argument("--json", action="store_true", help="终端输出原始单行 JSON，便于脚本解析")
     p = commands.add_parser("generate")
-    p.add_argument("--output", help="手动输入文件路径；省略时存入 input/类型/月日/编号")
+    p.add_argument("--output", help="手动输入文件路径；省略时存入 input/月日/编号.dtype")
     p.add_argument("--rows", type=int, default=128)
     p.add_argument("--cols", type=int, default=129)
     p.add_argument("--dtype", choices=["fp32", "fp16"], default="fp32")
@@ -316,7 +422,10 @@ def main():
     p.add_argument("--seed", type=int, default=1234)
     p = commands.add_parser("evaluate")
     p.add_argument("--backend", choices=["cuda", "musa"], default="cuda")
-    p.add_argument("--directory", required=True, help="new output directory")
+    p.add_argument("--directory", type=Path, help="可选新输出目录；默认 output/evaluation-v1/后端，重复运行加编号")
+    p.add_argument("--input-directory", type=Path, help="固定评估输入目录；默认 input/evaluation-v1")
+    p = commands.add_parser("prepare-evaluation", help="只准备固定误差评估输入，不启动 GPU")
+    p.add_argument("--input-directory", type=Path, default=PROJECT / "input/evaluation-v1")
     args = parser.parse_args()
     if args.command == "run":
         run(read_config(args.config), args.input, args.prefix, console_json=args.json, backend=args.backend)
@@ -327,44 +436,11 @@ def main():
         else:
             path = generate_automatic(args.rows, args.cols, args.dtype, args.distribution, args.seed)
         print(f"输入文件: {path}")
+    elif args.command == "prepare-evaluation":
+        directory, _ = prepare_evaluation_inputs(args.input_directory)
+        print(f"固定评估输入: {directory}")
     else:
-        directory = Path(args.directory).resolve()
-        directory.mkdir(parents=True, exist_ok=False)
-        records = []
-        # 共 2 输入类型 * 3 分布 * 2 格式 * 2 scale 模式 * 2 舍入 * 3 输出 = 144 组。
-        # 同一输入用于不同配置；这是误差评估，不是重复计时的正式 benchmark。
-        for dtype in ("fp32", "fp16"):
-            for distribution in ("uniform", "normal", "outlier"):
-                source = directory / f"{distribution}.{dtype}"
-                generate(source, 128, 129, dtype, distribution, 1234)
-                for fmt in ("mxfp8", "nvfp4"):
-                    for mode in ("block", "tensor"):
-                        for rounding in ("nearest", "stochastic"):
-                            for output in ("fp32", "fp16", "bf16"):
-                                cfg = dict(
-                                    format=fmt,
-                                    block_size=32 if fmt == "mxfp8" else 16,
-                                    scale_mode=mode,
-                                    rounding=rounding,
-                                    output_type=output,
-                                    seed=1234,
-                                    target_gpu="unspecified; see benchmark environment",
-                                )
-                                # 中间 packed/反量化文件只在临时目录生成，最终 output 只保留三类统计。
-                                with tempfile.TemporaryDirectory(prefix="lp-eval-") as temp:
-                                    record = run(
-                                        cfg, source,
-                                        Path(temp) / f"{distribution}_{dtype}_{fmt}_{mode}_{rounding}_{output}",
-                                        console_json=True, backend=args.backend,
-                                    )
-                                records.append(dict(record, distribution=distribution))
-        # 每种分布一个统计文件，完整组合明细保留在 records 中，不污染最终 output。
-        for distribution in ("uniform", "normal", "outlier"):
-            selected = [r for r in records if r["distribution"] == distribution]
-            (directory / f"{distribution}.json").write_text(
-                json.dumps(selected, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-        (directory / "summary.json").write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        evaluate(args.backend, args.directory, args.input_directory)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 """不启动 profiler 或正式性能测试，检查迁移后的工具路径和报告生成。"""
 import importlib.util
 import datetime
+import contextlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -20,6 +22,70 @@ def load_tool(name):
 
 
 class ToolTests(unittest.TestCase):
+    def test_evaluation_inputs_reuse_and_reject_changes(self):
+        tool = load_tool("quantize")
+        with tempfile.TemporaryDirectory() as folder:
+            inputs, manifest = tool.prepare_evaluation_inputs(Path(folder) / "input")
+            self.assertEqual(len(manifest["sha256"]), 6)
+            before = {name: (inputs / name).stat().st_mtime_ns for name in manifest["sha256"]}
+            self.assertEqual(tool.prepare_evaluation_inputs(inputs)[1], manifest)
+            self.assertEqual(before, {name: (inputs / name).stat().st_mtime_ns for name in before})
+            (inputs / "normal.fp16").unlink()
+            tool.prepare_evaluation_inputs(inputs)
+            self.assertEqual(tool.input_sha256(inputs / "normal.fp16"), manifest["sha256"]["normal.fp16"])
+            (inputs / "uniform.fp32").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                tool.prepare_evaluation_inputs(inputs)
+            self.assertEqual((inputs / "uniform.fp32").read_bytes(), b"changed")
+
+    def test_evaluation_artifacts_and_backend_isolation(self):
+        tool = load_tool("quantize")
+
+        def fake_run(cfg, source, prefix, backend, quiet):
+            prefix.parent.mkdir(parents=True, exist_ok=True)
+            packed = Path(str(prefix) + ".lpq")
+            output = Path(str(prefix) + "." + cfg["output_type"])
+            packed.write_bytes(b"packed")
+            output.write_bytes(b"tensor")
+            return dict(input=str(source), packed=str(packed), output=str(output), backend=backend,
+                        input_sha256=tool.input_sha256(source), config=cfg,
+                        cpu_quant_match=True, cpu_dequant_match=True)
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(tool, "PROJECT", Path(folder)), \
+             patch.object(tool, "executable"), patch.object(tool, "run", side_effect=fake_run), \
+             contextlib.redirect_stdout(io.StringIO()):
+            cuda = tool.evaluate("cuda")
+            musa = tool.evaluate("musa")
+            repeat = tool.evaluate("cuda")
+            self.assertEqual((cuda.name, musa.name, repeat.name), ("cuda", "musa", "cuda-2"))
+            for directory in (cuda, musa, repeat):
+                summary = json.loads((directory / "summary.json").read_text())
+                self.assertEqual(len(summary), 144)
+                self.assertEqual(json.loads((directory / "status.json").read_text())["state"], "complete")
+                self.assertFalse(list(directory.glob("*.fp*")))
+                for distribution in ("uniform", "normal", "outlier"):
+                    self.assertEqual(len(json.loads((directory / f"{distribution}.json").read_text())), 48)
+                for r in summary:
+                    self.assertTrue(Path(r["input"]).is_relative_to(Path(folder) / "input/evaluation-v1"))
+                    for key in ("packed", "output"):
+                        self.assertTrue(Path(r[key]).is_file())
+                        self.assertTrue(Path(r[key]).is_relative_to(directory))
+            with self.assertRaises(FileExistsError):
+                tool.evaluate("cuda", cuda)
+
+    def test_failed_evaluation_keeps_explicit_status(self):
+        tool = load_tool("quantize")
+        with tempfile.TemporaryDirectory() as folder, patch.object(tool, "PROJECT", Path(folder)), \
+             patch.object(tool, "executable"), \
+             patch.object(tool, "run", side_effect=ValueError("device failed")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "device failed"):
+                tool.evaluate("cuda")
+            directory = Path(folder) / "output/evaluation-v1/cuda"
+            self.assertEqual(json.loads((directory / "summary.json").read_text()), [])
+            status = json.loads((directory / "status.json").read_text())
+            self.assertEqual((status["state"], status["completed"], status["expected"]), ("failed", 0, 144))
+
     def test_comparison_rejects_changed_conditions(self):
         tool = load_tool("compare_benchmarks")
         env = dict(protocol="fixed-fp32-v1", formal=True,
@@ -133,7 +199,8 @@ class ToolTests(unittest.TestCase):
 
                 def fake_run(command, **kwargs):
                     calls.append(command)
-                    text = "pipeline::nvfp4_quantize_fused_kernel pipeline::mxfp8_quantize_fused_kernel" if valid else "SKIPPED"
+                    # 从实现导出的常量派生，测试不再各写一份 kernel 名。
+                    text = " ".join(tool.DEFAULT_KERNEL.values()) if valid else "SKIPPED"
                     return subprocess.CompletedProcess(command, 0, text, "")
 
                 output = Path(folder) / "profile"

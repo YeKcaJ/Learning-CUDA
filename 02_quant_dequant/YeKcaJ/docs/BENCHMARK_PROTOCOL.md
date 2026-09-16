@@ -33,6 +33,32 @@ python3 Core/tools/benchmark.py --backend musa --directory records/my-next-musa
 
 `--repeats` 正式固定20；非20次需显式 `--exploratory`，这种结果不允许进入正式跨平台对比。直接运行旧式 `pipeline --benchmark N R` 仍可诊断，但没有冻结文件/元数据，不当正式记录。旧二进制不支持新增的文件参数时，先按相同算法版本重建，不静默退回旧入口。
 
+### 冻结输入不在版本库里
+
+`input/**/*.fp32` 被 `.gitignore` 排除，仓库只保留 `manifest.json` 和
+`Core/configs/benchmark-inputs-v1.json` 两个哈希清单。因此**新克隆的仓库直接跑
+`benchmark.py` 会报 `fixed input missing`，这是预期行为**，不是脚本坏了。
+
+恢复方式：用同一份源码重建二进制，执行导出命令。导出的文件由固定 seed 生成，
+实测与冻结文件逐字节一致，SHA256 与两个清单相符后才会开始计时。
+
+```bash
+cmake --build Core/build -j 4
+mkdir -p input/benchmark-v1
+for n in 1048576 4194304 16777216; do
+  Core/build/pipeline_mxfp8 --benchmark-export "$n" "input/benchmark-v1/normal_$n.fp32"
+done
+```
+
+导出后核对（应分别等于两个清单里的值）：
+
+```bash
+sha256sum input/benchmark-v1/normal_*.fp32
+```
+
+`benchmark.py` 会在计时前后各校验一次哈希，缺失或被改动都会拒绝测试。若哈希与清单
+不符，说明源码中的输入生成逻辑已被改动，此时不能用新文件冒充 v1 数据，应新建语料版本。
+
 每份报告保存完整输入参数、输入/二进制/源码 SHA256、设备/编译器、所有命令返回的 JSONL。GPU任务串行执行；接电、关闭其他GPU任务、保持同一功耗设置，记下额外环境变化。当前未锁频，因此不声称硬件状态绝对一致。
 
 ## 加速比只有两列

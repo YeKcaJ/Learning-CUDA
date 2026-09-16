@@ -1,176 +1,281 @@
-# 核心程序说明
+# Core：正式程序
 
-正式程序由一个 Python 配置入口和两个格式可执行程序组成，编译时选择 CUDA 或 MUSA 后端。Core 包含全部源码和冻结参考数据，可以单独复制、重新构建；不要复制旧 build 缓存。
-这里的文件按职责划分，优化算子主要看 `kernels/`。
+全部正式源码、构建定义、配置、CPU 参考实现与测试都在这里。`Core` 可以单独复制并重新构建；不要复制 `build`、`build-musa` 等构建缓存。
 
-## 1. 目录与调用关系
+正式运行只通过一个入口：`Core/tools/quantize.py`。它调用编译出的两个后端可执行文件，按配置选择量化格式。
 
-```text
-Core/
-├── backends/musa/          MUSA 融合 kernel、运行时名称兼容层及使用说明
-├── app/                    程序入口和文件任务
-│   ├── main.cpp            分发命令、统一处理异常
-│   ├── commands.h          文件任务、benchmark、自测的接口声明
-│   └── run.cu              量化/反量化流程与误差日志
-├── kernels/                GPU 算子和设备编码辅助
-│   ├── mxfp8_quantize.cuh   MXFP8 block+nearest 融合量化
-│   ├── nvfp4_quantize.cuh   NVFP4 block+nearest 融合量化/打包
-│   ├── dequantize.cuh      两种格式的三种类型反量化
-│   ├── reduce.cuh          全局最大值的两级归约
-│   ├── fallback_quantize.cuh  tensor、随机舍入、内部对照
-│   ├── codec.cuh           E4M3/E2M1 编码解码
-│   └── scale.cuh           scale 字节与有效乘数
-├── runtime/                GPU 执行管理
-│   ├── workspace.cuh       显存、上传、下载的接口
-│   ├── workspace.cu        唯一的正式 kernel 启动实现
-│   └── cuda_utils.cuh      显存 RAII、event、错误检查
-├── io/                     输入、packed、反量化文件读写
-├── common/                 数据结构、随机数、输出转换、墙钟计时
-├── reference/              CPU 校验，独立于 GPU 编码器
-│   ├── oracle.cpp/.h       block/tensor、两种舍入的 CPU 对照
-│   ├── frozen.cpp/.h       冻结 CPU 算法桥接
-│   ├── mxfp8/              原 CPU 源码及 tests/data、tests/golden
-│   └── nvfp4/              原 CPU 源码及 tests/data、tests/golden
-├── benchmarks/benchmark.cu  正式计时、统计与 JSONL
-├── tests/                  算法回归、文件与工具测试
-├── tools/                  quantize.py、benchmark.py、profile.py
-├── configs/                两种格式的 TOML 示例
-└── CMakeLists.txt           构建定义
+---
+
+## 目录作用
+
+| 目录 | 作用 |
+|---|---|
+| `app/` | 程序入口与文件任务：分发命令、执行量化/反量化流程、写误差日志 |
+| `kernels/` | GPU 算子与设备端编码辅助 |
+| `runtime/` | 显存、上传下载、kernel 启动与计时 |
+| `common/` | 公共数据结构、随机数、输出类型转换、计时 |
+| `io/` | 输入文件、packed 权重、反量化张量的读写 |
+| `reference/` | CPU 参考实现（用于校验 GPU 结果），含冻结数据 |
+| `benchmarks/` | 正式性能计时与统计 |
+| `tests/` | 算法回归、文件与工具测试 |
+| `tools/` | Python 入口与辅助脚本 |
+| `configs/` | 两种格式的 TOML 配置 |
+| `backends/musa/` | 摩尔线程 MUSA 后端，见其 [README](backends/musa/README.md) |
+| `CMakeLists.txt` | 构建定义，用 `LP_BACKEND` 选择后端 |
+
+两个后端可执行文件：`pipeline_mxfp8` 与 `pipeline_nvfp4`，由同一套源码按格式编译两次得到。
+
+---
+
+## 环境要求
+
+CMake ≥ 3.18、CUDA Toolkit、C++17、Python ≥ 3.11。
+
+`nvcc` 必须能被 CMake 找到。若报 `No CMAKE_CUDA_COMPILER could be found`，是 `nvcc` 不在 `PATH`，显式指定即可：
+
+```bash
+-DCMAKE_CUDA_COMPILER=$(which nvcc || echo /usr/local/cuda/bin/nvcc)
 ```
 
-运行方向：`tools/quantize.py → app/main.cpp → app/run.cu → runtime/workspace.cu → kernels/`。
-`app/run.cu` 另外调用 `io/` 读写文件、`reference/` 校验结果。
-`runtime/` 和 `kernels/` 不包含 CPU oracle 或文件读写代码；benchmark、自测分别编译，不再混在 main 中。
-`.cuh` 是 CUDA 头文件，里面可以定义 kernel；正式 kernel 定义只由 `runtime/workspace.cu` 包含并编译。
+默认架构为 `sm_75`，自带 PTX，可在更高架构 GPU 上运行，但会触发 JIT，性能不具代表性。做性能测量时按实际显卡指定：
 
-## 2. 找到要优化的 kernel
+```bash
+-DCMAKE_CUDA_ARCHITECTURES=89      # RTX 4090
+-DCMAKE_CUDA_ARCHITECTURES=86      # RTX 3060
+```
 
-| 路径/配置 | GPU 执行顺序 |
-|---|---|
-| CUDA MXFP8 block+nearest | `mxfp8_quantize_vectorized_kernel` |
-| MUSA block+nearest | NVFP4 先做全局两级归约，再由 `musa_quantize_vectorized_kernel` 量化；MXFP8 直接向量化融合量化 |
-| NVFP4 block+nearest | `maximum → finalize_max → nvfp4_quantize_fused_kernel` |
-| tensor 或 stochastic | 按需全局归约 → `build_scales` 或 `build_block_scales` → `quantize_kernel<false>` |
-| 内部 baseline | 按需全局归约 → `build_scales → quantize_kernel<true>` |
-| 任意格式反量化 | `dequantize_kernel<T>`，T 为 float、__half 或 __nv_bfloat16 |
+---
 
-默认融合条件是 `block + nearest`，与输入文件是 FP32 还是 FP16 无关。
-FP16 文件先在 CPU 精确展开为 FP32，再上传；这不是直接读取 FP16 显存的 kernel。BF16 当前仅支持输出。
+## 操作步骤
 
-## 3. 函数索引
+以下命令均在**项目根目录**执行。
 
-| 文件 | 函数/类型 | 具体作用 |
-|---|---|---|
-| [kernels/mxfp8_quantize.cuh](kernels/mxfp8_quantize.cuh) | `mxfp8_quantize_fused_kernel` | 每 warp 32 元素，归约最大值、计算/广播 E8M0 scale、编码 E4M3；复用寄存器输入 |
-| [kernels/nvfp4_quantize.cuh](kernels/nvfp4_quantize.cuh) | `nvfp4_quantize_fused_kernel` | 每线程两个元素、每 8 lane 一个分组；算 E4M3 scale，再编码/打包两个 E2M1 |
-| [kernels/dequantize.cuh](kernels/dequantize.cuh) | `dequantize_kernel<T>` | 解码数据、乘有效 scale，转换到 T；NVFP4 提取对应高/低 nibble |
-| [kernels/reduce.cuh](kernels/reduce.cuh) | `maximum` / `finalize_max` | 生成局部最大值，再归约为张量最大值并计算 NVFP4 global_scale |
-| 同上 | `block_maximum` | 固定 256 线程块，warp 内归约后合并 8 个最大值，仅一次整块同步 |
-| [kernels/scale.cuh](kernels/scale.cuh) | `scale_code` / `effective` | 编码 scale 字节；恢复两种格式的实际乘数 |
-| [kernels/codec.cuh](kernels/codec.cuh) | `encode_e4m3_nearest` | 用 FP32 指数/尾数直接生成 E4M3；中点向较小幅值，不是 nearest-even |
-| 同上 | `encode` | 分发快速 nearest、随机舍入、内部枚举；E2M1 nearest 使用固定中点比较 |
-| 同上 | `decode_e4m3` / `magnitude` | 恢复 E4M3 值或编码的非负幅值 |
-| 同上 | `encode_e4m3` / `encode_e2m1` | 内部对照用的枚举编码器，不能代表当前默认性能 |
-| [kernels/fallback_quantize.cuh](kernels/fallback_quantize.cuh) | `build_scales` / `build_block_scales` | 非融合路径的 shared 或 warp 分组 scale 归约 |
-| 同上 | `quantize_kernel<Baseline>` | 用已有 scale 编码，支持随机舍入和枚举对照 |
-| [runtime/workspace.cuh](runtime/workspace.cuh) | `Workspace` | 一次任务的显存、尺寸、配置和 CUDA events |
-| 同上 | `upload(values)` / `upload(packed)` | 上传 FP32 输入，或上传已有 packed 权重 |
-| 同上 | `download` / `download_output<T>` | 下载 packed 元数据/字节，或 T 类型张量 |
-| [runtime/workspace.cu](runtime/workspace.cu) | `launch_quant` / `launch_dequant<T>` | 选择量化路径，或启动指定输出类型的反量化 |
-| [runtime/cuda_utils.cuh](runtime/cuda_utils.cuh) | `DeviceBuffer` / `Events::measure` / `check_cuda` | 显存自动释放、设备序列计时、CUDA 错误转异常 |
-| [app/main.cpp](app/main.cpp) | `main` | 分发文件任务、独立反量化、benchmark、自测 |
-| [app/run.cu](app/run.cu) | `run_pipeline` | 参数检查、读取、上传、量化、CPU 比较及 packed 文件往返检查 |
-| 同上 | `finish<T>` | 反量化、CPU 对比、保存张量，计算误差/压缩率并打印 JSON |
-| 同上 | `restore_file` / `restore<T>` | 从已有 .lpq 独立反量化，不需要原始输入或 golden |
-| [io/tensor_io.h](io/tensor_io.h) | `read_input` | 校验输入头、形状和长度，展开 FP16，拒绝 NaN/Inf |
-| 同上 | `read_packed` / `write_packed` | v2 头、data、scale 的读写及格式检查 |
-| 同上 | `read_scalar` / `write_scalar` / `output_file` | 逐字段二进制读写，创建输出父目录 |
-| [io/output.cuh](io/output.cuh) | `write<T>` | 保存带形状与输出类型头的反量化张量 |
-| [reference/output_compare.cuh](reference/output_compare.cuh) | `compare<T>` | 与 CPU 输出比较，16 位结果逐位比较 |
-| [common/types.h](common/types.h) | `Options` / `Tensor` / `Packed` | 配置、统一 FP32 主机输入、低精度结果 |
-| 同上 | `ceil_div` / `data_size` / `checked_count` / `validate` | 向上取整、packed 字节数、溢出及 block 大小检查 |
-| [common/output_type.cuh](common/output_type.cuh) | `Format<T>::convert` | 输出类型转换和文件标识，16 位采用 nearest-even |
-| [common/numeric.h](common/numeric.h) | `random_unit` / `magnitude2` | 按 seed/index 生成随机数；返回 E2M1 幅值 |
-| [common/timing.h](common/timing.h) | `elapsed` | 主机墙钟毫秒，与设备 event 计时分开 |
-| [reference/oracle.cpp](reference/oracle.cpp) | `reference_encode` / `reference_quantize` / `reference_dequantize` | 独立 CPU 扩展对照；nearest 保留枚举，stochastic 线性找邻值 |
-| 同上 | `compare_packed` | 比较形状、分组、data/scales 及 global_scale 位模式 |
-| [reference/frozen.cpp](reference/frozen.cpp) | `cpu_reference` / `cpu_encode*` / `cpu_decode4` | 调用未改变的原 CPU 实现，适配两种格式字段 |
-| [benchmarks/benchmark.cu](benchmarks/benchmark.cu) | `benchmark` / `bench_dequant<T>` | 固定 FP32 数据，预热并测试量化、三种反量化、host_api 和 CPU |
-| 同上 | `percentile` / `stats` | 计算 median/P95 并输出 JSONL，逻辑 GB/s 不等于实测 DRAM 带宽 |
-| [tests/regression.cu](tests/regression.cu) | `self_test` / `check_encoder` / `encoder_probe` | 尾部、模式、类型、重复一致性及编码边界验证；probe 是测试专用 kernel |
-
-Python：`quantize.py` 的 `generate`/`generate_automatic` 创建带头输入，`read_config` 检查 TOML，`run` 调用后端并保存日志，`format_summary` 打印中文摘要；`benchmark.py` 保存性能与源码哈希，`profile.py` 采集并检查两种融合 kernel 的 nsys 数据。
-
-## 4. 操作步骤
-
-以下从项目根目录执行。配置、输入输出布局、后端名称沿用原来的方式。
-
-**① 构建和正确性检查**
+### ① 构建
 
 ```bash
 cmake -S Core -B Core/build -DCMAKE_BUILD_TYPE=Release
 cmake --build Core/build -j 4
+```
+
+产物：
+
+```
+Core/build/pipeline_mxfp8
+Core/build/pipeline_nvfp4
+```
+
+### ② 正确性检查
+
+```bash
 ctest --test-dir Core/build --output-on-failure
 ```
 
-9 个公共 CTest 入口覆盖工具、归约边界、设备算术、两种格式的文件/类型测试、算法回归与冻结哈希。MUSA 额外运行一项 shuffle 测试，共 10 项；算法回归另外用尾部哨兵检查 data、scale 和三种输出的越界写。
-MUSA 的构建、运行和函数说明见 [backends/musa/README.md](backends/musa/README.md)。
-`tests/reduction.cu` 独立检查局部/全局最大值及 global_scale，覆盖 warp 边界、跨步扫描尾部、零和极端有限值。
-也可运行 `./Core/build/pipeline_mxfp8 --self-test` 或 `./Core/build/pipeline_nvfp4 --self-test`。
-冻结文件只验证，不重新生成；关闭 BUILD_TESTING 会去掉算法自测代码，普通文件任务仍有 CPU 对照。
+预期输出：`100% tests passed, 0 tests failed out of 9`。
 
-**② 生成输入**
+| 测试项 | 检查内容 |
+|---|---|
+| `core_tools` | Python 工具行为 |
+| `core_reduction` | 局部/全局最大值归约与 global_scale，含 warp 边界与极端值 |
+| `core_device_math` | 设备端算术与 CPU 逐位对照 |
+| `<格式>_pipeline_io` | 文件读写、类型组合、尾部哨兵 |
+| `<格式>_pipeline_regression` | 对 CPU 参考实现的算法回归 |
+| `<格式>_frozen_hashes` | 冻结输入与 golden 的 SHA256 校验 |
+
+也可单独运行某项：
+
+```bash
+./Core/build/pipeline_mxfp8 --self-test          # 算法回归
+./Core/build/pipeline_nvfp4 --self-test
+ctest --test-dir Core/build -R mxfp8             # 只跑 MXFP8 相关
+```
+
+冻结文件只校验，不重新生成。关闭 `BUILD_TESTING` 会去掉算法自测代码，普通文件任务仍有 CPU 对照。
+
+### ③ 生成输入
 
 ```bash
 python3 Core/tools/quantize.py generate --dtype fp32 --rows 1024 --cols 1024
 ```
 
-支持 `--dtype fp16`。自动保存到 `input/<月日>/<编号>.<dtype>`，同一编号可同时存在 `.fp16` 和 `.fp32`；同时写清单，记下终端打印的实际路径。
+产物（终端打印实际路径）：
 
-**③ 配置并运行**
-
-修改 `Core/configs/mxfp8.toml` 或 `nvfp4.toml`：output_type 选择 fp32/fp16/bf16；融合路径用 `scale_mode="block"`、`rounding="nearest"`。
-
-```bash
-python3 Core/tools/quantize.py run --config Core/configs/mxfp8.toml \
-  --input input/914/1.fp32
-python3 Core/tools/quantize.py run --config Core/configs/nvfp4.toml \
-  --input input/914/1.fp32
+```
+input/<月日>/<编号>.fp32        输入张量，带头部，行主序
+input/<月日>/<编号>.fp32.json   形状、分布、种子与 sha256
 ```
 
-替换示例日期和编号。输出在 `output/914/1/<格式>/`，首次运行生成 `fp32_fp16.lpq`、`fp32_fp16.fp16` 和 `fp32_fp16.json`，重复运行追加 `_2`。
-重复执行增加 run 编号。外部输入使用 `--prefix` 指定新的输出前缀。
+`--dtype` 可选 `fp32` / `fp16`，`--distribution` 可选 `uniform` / `normal` / `outlier`。
+同一编号可同时存在 `.fp32` 和 `.fp16`。
 
-**④ 独立反量化已有权重**
+### ④ 量化并反量化
+
+配置在 `Core/configs/` 下。`output_type` 决定反量化输出类型（`fp32` / `fp16` / `bf16`）；融合路径使用 `scale_mode = "block"` 与 `rounding = "nearest"`。
+
+```bash
+python3 Core/tools/quantize.py run --config Core/configs/mxfp8.toml   --input input/916/1.fp32
+
+python3 Core/tools/quantize.py run --config Core/configs/nvfp4.toml   --input input/916/1.fp32
+```
+
+把示例日期与编号换成 ③实际打印的路径。
+
+产物：
+
+```
+output/<月日>/<编号>/<格式>/<backend>/<入>_<出>.lpq    低精度权重
+output/<月日>/<编号>/<格式>/<backend>/<入>_<出>.<出>   反量化张量
+output/<月日>/<编号>/<格式>/<backend>/<入>_<出>.json   误差与性能日志
+```
+
+`<backend>` 为 `cuda` 或 `musa`；`<入>_<出>` 形如 `fp32_fp16`。终端会打印三个文件的完整路径。
+重复运行同一输入不会覆盖旧结果，而是分配新前缀。
+
+附加参数：
+
+```bash
+--prefix /tmp/my-result     # 手动指定输出前缀
+--json                      # 终端输出单行 JSON，便于脚本解析
+```
+
+### ⑤ 独立反量化已有权重
+
+不需要原始输入或 CPU golden，直接从 `.lpq` 恢复：
 
 ```bash
 ./Core/build/pipeline_mxfp8 --dequant-file \
-  results/fp32/911/1/mxfp8/run-1/result.lpq \
-  results/fp32/911/1/mxfp8/run-1/restored.bf16 bf16
+  output/916/1/mxfp8/cuda/fp32_fp32.lpq \
+  /tmp/restored.bf16 bf16
 ```
 
-NVFP4 使用另一个后端。输出路径应另取未使用的名称；底层文件写出会覆盖同名文件。
+输出路径请取未使用过的名称；同名文件会被覆盖。最后一个参数可选 `fp32` / `fp16` / `bf16`。
+NVFP4 换成 `./Core/build/pipeline_nvfp4`。
 
-**⑤ 测性能并记录**
+### ⑥ 误差评估
+
+> 误差评估默认自动分配输出目录；性能测试显式指定的记录目录需要使用新名字，避免覆盖旧记录。
 
 ```bash
-python3 Core/tools/benchmark.py --directory records/my-before --repeats 20
+python3 Core/tools/quantize.py evaluate --backend cuda
 ```
 
-固定 FP32 正态输入、block+nearest、预热 3 次，测 1M/4M/16M。查看 RESULTS.md。
-算子优化使用 `input/benchmark-v1/` 中冻结并校验 SHA256 的 FP32 输入，预热3次、测量20次。比较同规模 `quant_optimized / resident_gpu` 的 median、P95、逻辑带宽；反量化按相同输出 dtype 比。加速比只列相对上一轮和第1轮，完整条件见 [固定协议](../docs/BENCHMARK_PROTOCOL.md)。
-输入读取、FP16 展开、CPU 校验、文件落盘不在驻留 GPU 计时内。单次 run 用于正确性和误差，不用于正式性能结论。
+产物：
 
-**⑥ 用 nsys 定位阶段**
+```
+input/evaluation-v1/{uniform,normal,outlier}.{fp32,fp16}   固定输入
+input/evaluation-v1/manifest.json                         参数和SHA256
+output/evaluation-v1/cuda/{uniform,normal,outlier}.json     分类误差统计
+output/evaluation-v1/cuda/summary.json                     全部组合汇总
+output/evaluation-v1/cuda/status.json                      完成状态
+output/evaluation-v1/cuda/<分布>/<格式>/                    每组权重、反量化张量与日志
+```
+
+覆盖 3 种分布 × 2 种输入类型 × 2 种格式 × 2 种缩放 × 2 种舍入 × 3 种输出 = 144 组。
+六份输入与每组的三类结果都持久保存。默认输出目录已存在时自动使用 `cuda-2`、`cuda-3`；显式传 `--directory` 时必须是**未存在**的新目录。`status.json` 中 `state=complete`、`completed=144` 表示整批完成，详见 [输出说明](../output/README.md)。
+
+### ⑦ 性能测试
 
 ```bash
-python3 Core/tools/profile.py --directory records/my-profile
+python3 Core/tools/benchmark.py --directory records/my-benchmark-01 --repeats 20
+```
+
+产物：
+
+```
+records/my-benchmark-01/RESULTS.md
+records/my-benchmark-01/summary.json
+records/my-benchmark-01/<格式>_<元素数>.jsonl
+records/my-benchmark-01/environment.json
+```
+
+固定 FP32、`block+nearest`，测 1M / 4M / 16M，预热 3 次。正式优化必须 `--repeats 20` 并复用 `input/benchmark-v1/` 的冻结输入；试跑加 `--exploratory`。条件与加速比口径见 [固定协议](../docs/BENCHMARK_PROTOCOL.md)。
+
+其他参数：
+
+```bash
+--backend musa                     # 换后端
+--build-directory /path/to/build   # 自定义构建目录
+--input-directory input/benchmark-v1
+--exploratory                      # 允许非 20 次，不能作为正式轮次
+```
+
+### ⑧ 用 nsys 定位阶段
+
+```bash
+python3 Core/tools/profile.py --directory records/my-profile-01
 nsys stats --force-export=true --report cuda_gpu_kern_sum \
-  records/my-profile/mxfp8.nsys-rep
+  records/my-profile-01/mxfp8.nsys-rep
 ```
 
-NVFP4 将报告名换为 nvfp4.nsys-rep。看第 2 节列出的默认 kernel；报告也含内部对照和预热，不能把累计 Time (%) 当作单次默认流程占比。
-改完 kernel 后重新构建、跑测试，再将 benchmark 保存到新的目录，并更新根目录 OPTIMIZATION_LOG.md。
+产物：
 
-完整误差组合：`python3 Core/tools/quantize.py evaluate --directory records/my-evaluation`（144 组）。
-GPU 检查：使用兼容驱动的 `compute-sanitizer --tool memcheck ./Core/build/pipeline_nvfp4 --self-test`；更换 tool 可检查 racecheck/synccheck，MXFP8 同理。
+```
+records/my-profile-01/mxfp8.nsys-rep      nsys 原始报告
+records/my-profile-01/nvfp4.nsys-rep
+records/my-profile-01/mxfp8.sqlite        nsys 导出的数据库
+records/my-profile-01/nvfp4.sqlite
+records/my-profile-01/mxfp8_capture.log   采集过程日志
+records/my-profile-01/nvfp4_capture.log
+records/my-profile-01/mxfp8_stats.txt     kernel 汇总
+records/my-profile-01/nvfp4_stats.txt
+records/my-profile-01/version.txt
+```
+
+仅适用于 CUDA 后端。`--directory` 同样必须是未存在的新目录。
+nsys 报告包含预热与内部对照，不能把累计占比当作单次默认流程占比。
+
+### ⑨ GPU 检查
+
+```bash
+compute-sanitizer --tool memcheck ./Core/build/pipeline_nvfp4 --self-test
+```
+
+`--tool` 可换 `racecheck`、`synccheck`。MXFP8 同理。
+
+---
+
+## 修改 kernel 后的流程
+
+1. 改 `Core/kernels/` 下的实现
+2. `cmake --build Core/build -j 4`
+3. `ctest --test-dir Core/build`（必须 9/9）
+4. benchmark 保存到**新目录**
+5. 更新根目录 `OPTIMIZATION_LOG.md`
+
+加速比只列相对上一轮与相对本格式第 1 轮的倍数。
+
+---
+
+## 底层可执行文件
+
+通常不需要直接调用。`python3 Core/tools/quantize.py` 已覆盖以下功能：
+
+```text
+文件任务: pipeline input packed output block|tensor nearest|stochastic fp32|fp16|bf16 block_size seed verify|noverify
+反量化:   pipeline --dequant-file packed output fp32|fp16|bf16
+性能测试: pipeline --benchmark elements repeats [fixed_input.fp32]
+固定输入: pipeline --benchmark-export elements output.fp32
+正确性:   pipeline --self-test [reference_directory]
+```
+
+`--benchmark-export` 用于重建冻结输入，用法见 [固定协议](../docs/BENCHMARK_PROTOCOL.md)。
+
+---
+
+## CPU 参考实现
+
+`reference/mxfp8/` 与 `reference/nvfp4/` 定义两种格式的确定性结果，GPU 实现必须以它们为对照。各自的构建与验证步骤见其 README：
+
+- [reference/mxfp8/README.md](reference/mxfp8/README.md)
+- [reference/nvfp4/README.md](reference/nvfp4/README.md)
+
+正常使用 CUDA 程序**不需要**单独构建这两个目录，CTest 已覆盖其冻结校验。
+
+---
+
+## 其他工具
+
+```bash
+python3 Core/tools/compare_benchmarks.py --output /tmp/cmp.md <a目录> <b目录>   # 比较两组结果
+python3 Core/tools/optimization_report.py                                       # 生成 CUDA 优化报告
+python3 Core/tools/cuda_optimization_report.py                                  # 生成累计效果报告
+```

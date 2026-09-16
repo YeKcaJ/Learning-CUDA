@@ -19,7 +19,7 @@ nsys 定位（4M，本次采集的 kernel 中位数）：
 - NVFP4：scale 计算 0.408688 ms，编码 0.091735 ms，全局归约两阶段合计约 0.072145 ms，优先关注 scale。
 
 正确性：7/7 核心测试通过。尚未修改 kernel。
-数据来源：[benchmark](records/01-before/benchmark/RESULTS.md)、[MXFP8 nsys](records/_archive/duplicate-runs/opt02-v1-profile/mxfp8_stats.txt)、[NVFP4 nsys](records/_archive/duplicate-runs/opt02-v1-profile/nvfp4_stats.txt)。
+数据来源：[benchmark](../../records/01-before/benchmark/RESULTS.md)、[MXFP8 nsys](../../records/_archive/duplicate-runs/opt02-v1-profile/mxfp8_stats.txt)、[NVFP4 nsys](../../records/_archive/duplicate-runs/opt02-v1-profile/nvfp4_stats.txt)。
 
 ## 第 1 次：MXFP8 直接编码 + scale 融合（2026-09-10）
 
@@ -37,7 +37,7 @@ nsys：4M 默认路径由两个 kernel 合为 `mxfp8_quantize_fused_kernel`，�
 复测：1M/4M/16M 中位数为 0.034816/0.122880/0.432128 ms；16M P95仍有波动。NVFP4 16M同环境旧/新对照为1.746352/1.737728 ms，未见稳定回退。
 正确性：7/7测试通过，覆盖中点两侧、随机FP32位模式和跨scale分组；Compute Sanitizer memcheck/racecheck/synccheck均0错误。
 结论：保留；本轮仅提升量化，反量化未优化。
-数据：[分步](records/02-mxfp8-direct-encode/benchmark/RESULTS.md)、[融合](records/03-mxfp8-fused-scale/benchmark/RESULTS.md)、[复测](records/03-mxfp8-fused-scale/repeat/RESULTS.md)、[nsys](records/03-mxfp8-fused-scale/profile/mxfp8_stats.txt)。
+数据：[分步](../../records/02-mxfp8-direct-encode/benchmark/RESULTS.md)、[融合](../../records/03-mxfp8-fused-scale/benchmark/RESULTS.md)、[复测](../../records/03-mxfp8-fused-scale/repeat/RESULTS.md)、[nsys](../../records/03-mxfp8-fused-scale/profile/mxfp8_stats.txt)。
 
 ## 第 2 次：NVFP4 block scale 直接编码 + 归约融合（2026-09-11）
 
@@ -140,7 +140,7 @@ nsys 验证（4M，`--benchmark` 含预热与 baseline 对照，故实例数多�
 本轮以 CPU oracle 逐字节比对 + 分组边界专项测试作为替代证据。
 
 结论：保留；NVFP4 量化提升 2.24x/3.17x/3.36x，MXFP8 未回退。
-数据：[benchmark](records/04-nvfp4-e4m3-scale-fused/benchmark/RESULTS.md)。
+数据：[benchmark](../../records/04-nvfp4-e4m3-scale-fused/benchmark/RESULTS.md)。
 
 ## 第 3 次：NVFP4 全局归约减少同步（2026-09-14）
 
@@ -160,7 +160,7 @@ nsys（4M）：`maximum` 中位数 0.062131 → 0.056339 ms，`finalize_max` 0.0
 交换顺序复测：1M 减少 25.9%，4M 减少 3.2%；16M 反而增加约 0.6%，后 P95 为 0.795648 ms，因此不声称 16M 有收益或尾延迟改善。
 正确性：8/8 核心测试通过；新增 220 组归约边界测试；归约专项及两种格式自测的 memcheck/racecheck/synccheck 全部 0 错误，memcheck 无泄漏。
 结论：保留，收益主要在 NVFP4 小中规模量化；MXFP8 默认量化与反量化算子不变。
-数据：[优化前](records/06-warp-reduction/before/benchmark/RESULTS.md)、[优化后](records/06-warp-reduction/after/benchmark/RESULTS.md)、[复测](records/06-warp-reduction/repeat/summary.json)、[验证](records/06-warp-reduction/VALIDATION.md)。
+数据：[优化前](../../records/06-warp-reduction/before/benchmark/RESULTS.md)、[优化后](../../records/06-warp-reduction/after/benchmark/RESULTS.md)、[复测](../../records/06-warp-reduction/repeat/summary.json)、[验证](../../records/06-warp-reduction/VALIDATION.md)。
 
 ## 第 4 次：MXFP8 向量化加载与打包写回（2026-09-14）
 
@@ -176,7 +176,7 @@ nsys（4M）：`maximum` 中位数 0.062131 → 0.056339 ms，`finalize_max` 0.0
 
 正确性：MXFP8 回归、冻结哈希、IO 测试均通过；`--self-test` 的 299 个 pipeline cases 通过。NVFP4 路径未改动，仅作为同批次运行对照。
 
-结论：当前中位数显示向量化版本有效，4M/16M 收益较稳定；1M 的 P95 受启动噪声影响，需后续 nsys/重复采样确认尾延迟。数据：[benchmark](records/07-mxfp8-vectorized/RESULTS.md)。
+结论：当前中位数显示向量化版本有效，4M/16M 收益较稳定；1M 的 P95 受启动噪声影响，需后续 nsys/重复采样确认尾延迟。数据：[benchmark](../../records/07-mxfp8-vectorized/RESULTS.md)。
 
 ## 第 5 次实验：workspace 复用对照（2026-09-14）
 
@@ -194,7 +194,7 @@ nsys（4M）：`maximum` 中位数 0.062131 → 0.056339 ms，`finalize_max` 0.0
 复测：4M 的 MXFP8/NVFP4 分别为 1.71x/1.70x，16M 均约 1.48x；1M 收益存在但幅度有波动。各规模两轮 P95 均下降。8/8 核心测试通过，两轮基准均通过复用结果的完整 packed 比较。
 
 结论：复用对同进程重复调用有效，不代表单次 CLI 或 kernel 本身获得相同加速；首次创建和最终释放不计入复用耗时。正式批量入口尚未实现。
-数据：[首轮](records/10-workspace-reuse/benchmark/RESULTS.md)、[复测](records/10-workspace-reuse/repeat/RESULTS.md)。
+数据：[首轮](../../records/10-workspace-reuse/benchmark/RESULTS.md)、[复测](../../records/10-workspace-reuse/repeat/RESULTS.md)。
 
 ## 第 6 次：NVFP4 全局归约 partial 数量调优（2026-09-14）
 
@@ -211,4 +211,4 @@ nsys（4M）：`maximum` 中位数 0.062131 → 0.056339 ms，`finalize_max` 0.0
 正确性：8/8 核心测试通过，归约边界测试通过；曾尝试直接将 maximum 改成连续 `float4` 加载，但会改变 partial 分段并被 `n=257` 专项测试捕获，已撤销该方案。
 
 结论：保留 partial=1024；收益主要在 1M，小规模和大规模均无明显回退。NVFP4 融合量化的计算受限部分尚未改变。
-数据：[首轮](records/11-nvfp4-partials1024/RESULTS.md)、[复测](records/11-nvfp4-partials1024/repeat/RESULTS.md)、[NCU](results/ncu/nvfp4-maximum-1024.ncu-rep)。
+数据：[首轮](../../records/11-nvfp4-partials1024/RESULTS.md)、[复测](../../records/11-nvfp4-partials1024/repeat/RESULTS.md)、[NCU](../../results/ncu/nvfp4-maximum-1024.ncu-rep)。

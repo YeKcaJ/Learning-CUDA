@@ -31,3 +31,5 @@ records/**/*.lpq
 records/**/*.fp32
 records/**/*.fp16
 records/**/*.bf16
+results/**/*.ncu-rep
+records/**/*.ncu-rep

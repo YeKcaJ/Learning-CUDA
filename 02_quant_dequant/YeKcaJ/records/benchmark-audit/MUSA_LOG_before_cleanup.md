@@ -34,7 +34,7 @@
 
 验证：MUSA 10/10 CTest、CUDA 9/9 CTest 通过；144 组 CPU 量化/反量化评估全部一致，含 FP32/FP16 输入与三种输出。完整内存/竞争检查仍待完成。
 
-原始数据：[优化前](../records/musa-opt01/baseline/RESULTS.md)、[步骤 1](../records/musa-opt01/step1/benchmark/RESULTS.md)、[步骤 2 最终构建](../records/musa-opt01/final-benchmark/RESULTS.md)、[交替复测](../records/musa-opt01/recheck/summary.json)。复现和验证证据见 [实验说明](../records/musa-opt01/README.md)。
+原始数据：[优化前](../musa-opt01/baseline/RESULTS.md)、[步骤 1](../musa-opt01/step1/benchmark/RESULTS.md)、[步骤 2 最终构建](../musa-opt01/final-benchmark/RESULTS.md)、[交替复测](../musa-opt01/recheck/summary.json)。复现和验证证据见 [实验说明](../musa-opt01/README.md)。
 
 ## 第 2 次优化：严格除法替代实现（2026-09-15）
 
@@ -64,4 +64,4 @@
 
 平台工具：MUPTI 已编译并尝试采集，但报 `MT-Perf not able to establish hw connection`，0 条 kernel 记录，不能据此判断硬件受限类型；当前容器未发现专用设备内存/竞争检查工具。需平台方开放 MT-Perf 并提供匹配工具，现阶段保留 event 分析结果。
 
-证据：[正式基准](../records/musa-opt02/after-divide/benchmark/RESULTS.md)、[交替复测](../records/musa-opt02/recheck/summary.json)、[实验说明](../records/musa-opt02/README.md)、[诊断操作步骤](../Core/backends/musa/tools/README.md)。
+证据：[正式基准](../musa-opt02/after-divide/benchmark/RESULTS.md)、[交替复测](../musa-opt02/recheck/summary.json)、[实验说明](../musa-opt02/README.md)、[诊断操作步骤](../../Core/backends/musa/tools/README.md)。

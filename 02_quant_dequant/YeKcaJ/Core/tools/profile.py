@@ -7,6 +7,13 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# 默认量化 kernel 名，必须与 runtime/workspace.cu 的启动代码一致。
+# 测试也从这里派生 mock 数据，避免测试与实现各写一份而悄悄失效。
+DEFAULT_KERNEL = {
+    "mxfp8": "pipeline::mxfp8_quantize_vectorized_kernel",
+    "nvfp4": "pipeline::nvfp4_quantize_fused_kernel",
+}
+
 
 # 串行采集两种格式的固定 4M benchmark，定位 kernel、API 和传输耗时。
 # 报告包含预热、内部对照、默认路径和 host_api 循环，并非只有一次量化。
@@ -55,8 +62,10 @@ def main():
         )
         (directory / f"{fmt}_stats.txt").write_text(result.stdout + result.stderr)
         result.check_returncode()
-        # 返回码成功不代表采到了 GPU 数据；还需检查核心 kernel 是否出现在报告中。
-        expected = f"pipeline::{fmt}_quantize_fused_kernel"
+        # 返回码成功不代表采到了 GPU 数据；还需检查默认量化 kernel 是否出现在报告中。
+        # 名字必须与 runtime/workspace.cu 的默认路径一致：MXFP8 已改为向量化 kernel，
+        # NVFP4 仍是两级归约 + 融合 kernel，两者不再共用一个后缀。
+        expected = DEFAULT_KERNEL[fmt]
         if expected not in result.stdout or "SKIPPED" in result.stdout:
             raise RuntimeError(f"missing profiler data for {fmt}; inspect capture log")
         print(f"{fmt}: kernel/API/memory data collected", flush=True)
