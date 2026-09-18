@@ -22,8 +22,8 @@
   "backend": "cuda",
   "target_gpu": "unspecified; see benchmark environment",
   "input": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/input/evaluation-v1/outlier.fp16",
-  "packed": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/output/evaluation-v1/cuda-3/outlier/nvfp4/fp16_fp32_block_stochastic.lpq",
-  "output": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/output/evaluation-v1/cuda-3/outlier/nvfp4/fp16_fp32_block_stochastic.fp32",
+  "packed": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/output/evaluation-v1/cuda/outlier/nvfp4/fp16_fp32_block_stochastic.lpq",
+  "output": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/output/evaluation-v1/cuda/outlier/nvfp4/fp16_fp32_block_stochastic.fp32",
   "input_sha256": "e049546cd6f696b7210762b4b35e8d3e21c0e6b3f405db48a8061786f3888f98",
   "config": {
     "format": "nvfp4",

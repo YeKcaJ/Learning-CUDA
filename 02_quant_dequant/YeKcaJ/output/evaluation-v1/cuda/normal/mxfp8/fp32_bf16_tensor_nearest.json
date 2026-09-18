@@ -22,8 +22,8 @@
   "backend": "cuda",
   "target_gpu": "unspecified; see benchmark environment",
   "input": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/input/evaluation-v1/normal.fp32",
-  "packed": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/output/evaluation-v1/cuda-3/normal/mxfp8/fp32_bf16_tensor_nearest.lpq",
-  "output": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/output/evaluation-v1/cuda-3/normal/mxfp8/fp32_bf16_tensor_nearest.bf16",
+  "packed": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/output/evaluation-v1/cuda/normal/mxfp8/fp32_bf16_tensor_nearest.lpq",
+  "output": "/home/jky/Learning-CUDA-project/02_quant_dequant/YeKcaJ/output/evaluation-v1/cuda/normal/mxfp8/fp32_bf16_tensor_nearest.bf16",
   "input_sha256": "30e8ccd6a9d385cdb9256c6d5c5e919a8bb62fdab4708b24c21dd7fa71ff94a0",
   "config": {
     "format": "mxfp8",
