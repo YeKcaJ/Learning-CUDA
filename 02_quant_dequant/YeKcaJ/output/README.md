@@ -4,6 +4,8 @@
 
 本目录只保存程序产出的结果，不放源码。
 
+`run` 默认保存全部三类文件；用户可用 `--save` 选择其中一类或多类。题目交付与 `evaluate` 批量评估保留全部三类。
+
 ---
 
 ## 目录结构
@@ -74,11 +76,23 @@ CUDA 与 MUSA 即使输入相同也分目录保存，避免互相覆盖。同一
 ### 单次运行
 
 ```bash
-python3 Core/tools/quantize.py run --config Core/configs/mxfp8.toml \
-  --input input/916/1.fp32
+python3 Core/tools/quantize.py run --input input/917/1.fp32 \
+  --format mxfp8 --output-type fp16 --output-dir output/917 --save all
 ```
 
-终端打印三个文件的完整路径。例如配置 `output_type = "fp16"` 时，FP32 输入产生 `output/916/1/mxfp8/cuda/fp32_fp16.{lpq,fp16,json}`。重复运行的文件名前缀依次加 `_2`、`_3`。
+输入路径按实际文件修改。以上命令直接产生 `output/917/1_mxfp8_cuda_fp32_fp16.{lpq,fp16,json}`，不添加额外子目录。终端显示输出文件夹及各文件的绝对路径。重复运行的文件名前缀依次加 `_2`、`_3`；格式与后端包含在文件名中，避免混淆。
+
+| 保存选项 | 保存的文件 |
+|---|---|
+| `--save all`（默认） | 权重、反量化张量、日志，题目要求的全部输出 |
+| `--save weights` | `.lpq` 权重 |
+| `--save tensor` | 指定精度的反量化张量 |
+| `--save log` | `.json` 误差与性能日志 |
+| `--save weights log` | 权重和日志，可自由组合三类选项 |
+
+保存选项不改变计算范围，仍执行完整量化、反量化与 CPU 对照；未选文件仅作为临时文件处理，完成后清理。JSON 的 `packed`、`output`、`log` 在未选对应文件时为 `null`，`saved_outputs` 记录所选类型，`output_directory` 记录保存目录。终端指标始终显示。
+
+`--output-type fp32/fp16/bf16` 控制输出精度；`--format mxfp8/nvfp4` 控制量化格式。可继续使用 `--config`，显式命令行参数覆盖配置。`--output-dir` 与旧的 `--prefix` 互斥；两者均省略时，沿用上方按输入日期/编号组织的自动目录。
 
 ### 误差评估
 

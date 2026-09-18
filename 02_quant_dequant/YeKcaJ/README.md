@@ -85,25 +85,37 @@ input/<月日>/<编号>.fp32.json   形状、分布、种子与 sha256
 
 ### ③ 量化并反量化
 
+直接指定输入、量化格式、反量化精度和输出文件夹，无需修改配置文件：
+
 ```bash
-python3 Core/tools/quantize.py run --config Core/configs/mxfp8.toml \
-  --input input/916/1.fp32
+python3 Core/tools/quantize.py run \
+  --input input/917/1.fp32 \
+  --format mxfp8 --output-type fp16 \
+  --output-dir output/917 --save all
+```
 
+把示例输入换成 ②实际打印的路径。`--format` 可选 `mxfp8` / `nvfp4`；`--output-type` 可选 `fp32` / `fp16` / `bf16`。输入类型从文件头读取，支持 FP32/FP16。
+
+上述命令直接在指定文件夹保存三类文件，终端打印绝对路径：
+
+```
+output/917/1_mxfp8_cuda_fp32_fp16.lpq     低精度权重：header + packed data + scale
+output/917/1_mxfp8_cuda_fp32_fp16.fp16    反量化张量，行主序
+output/917/1_mxfp8_cuda_fp32_fp16.json    误差、压缩率、kernel 时间、带宽
+```
+
+`--save all` 为默认值，保存题目要求的全部输出；也可用 `--save weights log` 仅保存权重和日志，或 `--save tensor` 仅保存反量化张量。选择只影响文件保存，完整计算、误差统计和 CPU 对照仍执行。题目交付使用 `all`。重复运行自动加 `_2`、`_3`，格式和后端也包含在文件名中。
+
+不提供配置时默认 `cuda / fp32输出 / block / nearest / seed=1234`；可通过 `--backend`、`--output-type`、`--scale-mode`、`--rounding`、`--seed` 调整。block size 随量化格式固定为 32 或 16。
+
+原配置文件入口仍可用，显式命令行参数优先于配置：
+
+```bash
 python3 Core/tools/quantize.py run --config Core/configs/nvfp4.toml \
-  --input input/916/1.fp32
+  --input input/917/1.fp32 --output-type bf16
 ```
 
-把示例日期和编号替换成 ②实际打印的路径。配置中的 `output_type` 决定反量化输出类型。
-
-产物（`<格式>` 为 `mxfp8` 或 `nvfp4`，`<backend>` 为 `cuda` 或 `musa`）：
-
-```
-output/<月日>/<编号>/<格式>/<backend>/fp32_fp32.lpq    低精度权重：header + packed data + scale
-output/<月日>/<编号>/<格式>/<backend>/fp32_fp32.fp32  反量化张量，行主序
-output/<月日>/<编号>/<格式>/<backend>/fp32_fp32.json  误差、压缩率、kernel 时间、带宽
-```
-
-文件名前缀为 `<输入dtype>_<输出dtype>`。这三个文件即题目要求的三类输出，详见 [output/README.md](output/README.md)。
+省略 `--output-dir` 和 `--prefix` 时沿用自动目录 `output/<月日>/<编号>/<格式>/<backend>/<输入dtype>_<输出dtype>.*`；其他位置的输入请指定 `--output-dir`。详见 [输出说明](output/README.md)。
 
 ### ④ 独立反量化已有权重
 

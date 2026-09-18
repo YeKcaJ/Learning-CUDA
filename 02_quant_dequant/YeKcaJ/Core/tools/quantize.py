@@ -19,13 +19,13 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT.parent
 
 
-# 自动结果接受 input/<月日>/<编号>.<dtype>，外部输入继续手动指定 --prefix。
+# 自动结果接受 input/<月日>/<编号>.<dtype>，其他输入可指定 --output-dir 或 --prefix。
 def automatic_prefix(source, cfg, backend="cuda"):
     source = Path(source).resolve()
     try:
         relative = source.relative_to((PROJECT / "input").resolve())
     except ValueError:
-        raise ValueError("external input requires --prefix; automatic paths use project input/")
+        raise ValueError("external input requires --output-dir or --prefix; automatic paths use project input/")
     if len(relative.parts) != 2 or relative.suffix.lstrip(".") not in ("fp16", "fp32"):
         raise ValueError("automatic input layout must be input/monthday/number.fp16|fp32")
     day, filename = relative.parts
@@ -64,6 +64,10 @@ def input_sha256(source):
 def read_config(path):
     with Path(path).open("rb") as stream:
         cfg = tomllib.load(stream)
+    return validate_config(cfg)
+
+
+def validate_config(cfg):
     allowed = {
         "format",
         "block_size",
@@ -102,6 +106,42 @@ def read_config(path):
     if not isinstance(cfg["target_gpu"], str):
         raise ValueError("target_gpu must be a string")
     return cfg
+
+
+def run_config(args):
+    # 命令行覆盖配置；切换格式时同时切换该格式规定的 block size。
+    cfg = read_config(args.config) if args.config else {}
+    if args.format is not None:
+        if args.format != cfg.get("format"):
+            cfg["block_size"] = 32 if args.format == "mxfp8" else 16
+        cfg["format"] = args.format
+    if "format" not in cfg:
+        raise ValueError("请用 --format 指定 mxfp8/nvfp4，或用 --config 指定配置文件")
+    for key in ("output_type", "scale_mode", "rounding", "seed"):
+        if getattr(args, key) is not None:
+            cfg[key] = getattr(args, key)
+    return validate_config(cfg)
+
+
+def input_dtype(source):
+    with Path(source).open("rb") as stream:
+        magic = stream.read(8)
+    if magic not in (b"FP32INP1", b"FP16INP1"):
+        raise ValueError("输入必须是带项目文件头的 FP32/FP16 二进制张量")
+    return "fp32" if magic == b"FP32INP1" else "fp16"
+
+
+def directory_prefix(source, cfg, backend, directory):
+    # 直接在用户指定目录中保存；文件名包含格式和平台，顺序重复运行自动编号。
+    directory = Path(directory).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = f"{source.stem}_{cfg['format']}_{backend}_{input_dtype(source)}_{cfg['output_type']}"
+    index = 1
+    while True:
+        prefix = directory / (stem if index == 1 else f"{stem}_{index}")
+        if not any(Path(str(prefix) + ext).exists() for ext in (".lpq", ".json", ".fp32", ".fp16", ".bf16")):
+            return prefix
+        index += 1
 
 
 # 两种格式分别构建一个 pipeline 程序，Python 不实现量化 kernel。
@@ -183,6 +223,8 @@ def format_summary(record, log):
     )
     lines.extend(["  主机流程含分配、上传、计算及下载，不含释放。", ""])
     lines.append("[文件]")
+    if record.get("output_directory"):
+        lines.extend(["  输出目录:", f"    {record['output_directory']}"])
     # 长路径单独一行，便于选择复制，不截断真实文件名。
     for label, path in [
         ("输入", record["input"]),
@@ -190,52 +232,62 @@ def format_summary(record, log):
         ("反量化张量", record["output"]),
         ("JSON 日志", log),
     ]:
-        lines.extend([f"  {label}:", f"    {path}"])
+        lines.extend([f"  {label}:", f"    {path if path is not None else '未选择保存'}"])
     return "\n".join(lines)
 
 
 # 生成输出路径 -> 调用 pipeline 做 CPU/GPU 对照 -> 保存 JSON -> 打印摘要。
-def run(cfg, source, prefix=None, console_json=False, backend="cuda", quiet=False):
+def run(cfg, source, prefix=None, console_json=False, backend="cuda", quiet=False,
+        output_dir=None, save=None):
+    cfg = validate_config(cfg)
+    selected = set(("all",) if save is None else save)
+    if not selected or not selected <= {"all", "weights", "tensor", "log"}:
+        raise ValueError("--save 请选择 all、weights、tensor、log")
+    if "all" in selected:
+        if len(selected) != 1:
+            raise ValueError("--save all 不能与其他选项混用")
+        selected = {"weights", "tensor", "log"}
+    if prefix is not None and output_dir is not None:
+        raise ValueError("--prefix 与 --output-dir 不能同时指定")
     source = Path(source).resolve()
     binary = executable(cfg["format"], backend)
     source_hash = input_sha256(source)
-    automatic = prefix is None
-    prefix = automatic_prefix(source, cfg, backend) if automatic else Path(prefix).resolve()
-    if automatic:
-        packed, output, log = (Path(str(prefix) + ".lpq"), Path(str(prefix) + "." + cfg["output_type"]), Path(str(prefix) + ".json"))
+    if output_dir is not None:
+        prefix = directory_prefix(source, cfg, backend, output_dir)
     else:
-        packed, output, log = (Path(str(prefix) + ".lpq"), Path(str(prefix) + "." + cfg["output_type"]), Path(str(prefix) + ".json"))
+        prefix = automatic_prefix(source, cfg, backend) if prefix is None else Path(prefix).resolve()
+    packed, output, log = (Path(str(prefix) + ".lpq"), Path(str(prefix) + "." + cfg["output_type"]), Path(str(prefix) + ".json"))
     if source in (packed, output, log):
         raise ValueError("output paths must differ from input")
     # 默认不覆盖已有结果；换前缀即可保留不同配置的实验记录。
     for path in (packed, output, log):
         if path.exists():
             raise ValueError(f"output exists, use a new prefix: {path}")
-    # 参数顺序对应 app/run.cu；verify 启用 CPU 量化逐字节校验。
-    command = [
-        str(binary),
-        str(source),
-        str(packed),
-        str(output),
-        cfg["scale_mode"],
-        cfg["rounding"],
-        cfg["output_type"],
-        str(cfg["block_size"]),
-        str(cfg["seed"]),
-        "verify",
-    ]
-    # 子程序失败时立即抛出异常，不将失败运行写成正常日志。
-    result = subprocess.run(command, text=True, capture_output=True, check=True)
-    record = json.loads(result.stdout.splitlines()[-1])
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    # 保存选项只控制交付文件。完整计算与 CPU 校验仍执行，未选文件在临时目录自动清理。
+    with tempfile.TemporaryDirectory(prefix="lp-run-") as temp:
+        device_packed = packed if "weights" in selected else Path(temp) / "weights.lpq"
+        device_output = output if "tensor" in selected else Path(temp) / ("tensor." + cfg["output_type"])
+        command = [str(binary), str(source), str(device_packed), str(device_output),
+                   cfg["scale_mode"], cfg["rounding"], cfg["output_type"],
+                   str(cfg["block_size"]), str(cfg["seed"]), "verify"]
+        # 子程序失败时立即抛出异常，不将失败运行写成正常日志。
+        result = subprocess.run(command, text=True, capture_output=True, check=True)
+        record = json.loads(result.stdout.splitlines()[-1])
     record.update(
         backend=backend,
-        target_gpu=cfg["target_gpu"], input=str(source), packed=str(packed), output=str(output),
+        target_gpu=cfg["target_gpu"], input=str(source),
+        packed=str(packed) if "weights" in selected else None,
+        output=str(output) if "tensor" in selected else None,
+        log=str(log) if "log" in selected else None,
+        output_directory=str(prefix.parent), saved_outputs=sorted(selected),
         input_sha256=source_hash, config=dict(cfg),
         created_at=datetime.datetime.now().astimezone().isoformat(),
     )
-    log.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if "log" in selected:
+        log.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if not quiet:
-        print(json.dumps(record, ensure_ascii=False) if console_json else format_summary(record, log))
+        print(json.dumps(record, ensure_ascii=False) if console_json else format_summary(record, record["log"]))
     return record
 
 
@@ -409,9 +461,18 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("run")
     p.add_argument("--backend", choices=["cuda", "musa"], default="cuda")
-    p.add_argument("--config", required=True)
+    p.add_argument("--config", help="可选 TOML 配置；显式命令行参数优先")
+    p.add_argument("--format", choices=["mxfp8", "nvfp4"], help="量化格式；不传配置时必填")
+    p.add_argument("--output-type", choices=["fp32", "fp16", "bf16"], help="反量化精度，未配置时默认 fp32")
+    p.add_argument("--scale-mode", choices=["block", "tensor"], help="缩放方式，默认 block")
+    p.add_argument("--rounding", choices=["nearest", "stochastic"], help="舍入方式，默认 nearest")
+    p.add_argument("--seed", type=int, help="舍入随机种子，默认 1234")
     p.add_argument("--input", required=True)
-    p.add_argument("--prefix", help="手动输出前缀；省略时按 input 目录结构自动分配结果")
+    destination = p.add_mutually_exclusive_group()
+    destination.add_argument("--prefix", help="手动输出前缀；已有文件不覆盖")
+    destination.add_argument("--output-dir", type=Path, help="输出文件夹；自动命名并显示实际保存路径")
+    p.add_argument("--save", nargs="+", choices=["all", "weights", "tensor", "log"], default=["all"],
+                   help="保存哪些文件：all 全部（默认）、weights 权重、tensor 反量化张量、log 误差与性能日志；可多选")
     p.add_argument("--json", action="store_true", help="终端输出原始单行 JSON，便于脚本解析")
     p = commands.add_parser("generate")
     p.add_argument("--output", help="手动输入文件路径；省略时存入 input/月日/编号.dtype")
@@ -428,7 +489,8 @@ def main():
     p.add_argument("--input-directory", type=Path, default=PROJECT / "input/evaluation-v1")
     args = parser.parse_args()
     if args.command == "run":
-        run(read_config(args.config), args.input, args.prefix, console_json=args.json, backend=args.backend)
+        run(run_config(args), args.input, args.prefix, console_json=args.json, backend=args.backend,
+            output_dir=args.output_dir, save=args.save)
     elif args.command == "generate":
         if args.output:
             generate(args.output, args.rows, args.cols, args.dtype, args.distribution, args.seed)

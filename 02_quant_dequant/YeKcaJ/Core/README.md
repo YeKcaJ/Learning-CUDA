@@ -109,6 +109,17 @@ input/<月日>/<编号>.fp32.json   形状、分布、种子与 sha256
 
 ### ④ 量化并反量化
 
+推荐直接指定参数：
+
+```bash
+python3 Core/tools/quantize.py run --input input/917/1.fp32 \
+  --format mxfp8 --output-type fp16 --output-dir output/917 --save all
+```
+
+输入换成 ③打印的实际路径。`--format` 选择 `mxfp8/nvfp4`，`--output-type` 选择 `fp32/fp16/bf16`，`--output-dir` 指定实际保存目录，文件名为 `<输入名>_<格式>_<backend>_<入>_<出>.*`。重复运行自动编号。`--save` 默认 `all`，可改为 `weights`、`tensor`、`log` 或组合，如 `--save weights log`；只控制保存，完整计算和 CPU 校验仍执行。
+
+以下配置文件用法继续支持，命令行显式参数优先于配置。省略配置时默认 `block/nearest/seed=1234`、FP32 输出；格式必须指定，block size 由格式决定。
+
 配置在 `Core/configs/` 下。`output_type` 决定反量化输出类型（`fp32` / `fp16` / `bf16`）；融合路径使用 `scale_mode = "block"` 与 `rounding = "nearest"`。
 
 ```bash
@@ -119,7 +130,7 @@ python3 Core/tools/quantize.py run --config Core/configs/nvfp4.toml   --input in
 
 把示例日期与编号换成 ③实际打印的路径。
 
-产物：
+省略 `--output-dir` 和 `--prefix` 时的产物：
 
 ```
 output/<月日>/<编号>/<格式>/<backend>/<入>_<出>.lpq    低精度权重
@@ -134,6 +145,12 @@ output/<月日>/<编号>/<格式>/<backend>/<入>_<出>.json   误差与性能�
 
 ```bash
 --prefix /tmp/my-result     # 手动指定输出前缀
+--output-dir output/917     # 手动指定文件夹，与 --prefix 二选一
+--save weights log          # 仅保存权重及日志；默认 all 保存题目要求的全部文件
+--output-type bf16          # 覆盖配置中的输出精度
+--scale-mode tensor         # 覆盖缩放方式，block/tensor
+--rounding stochastic       # 覆盖舍入方式，nearest/stochastic
+--seed 1234                 # 舍入随机种子
 --json                      # 终端输出单行 JSON，便于脚本解析
 ```
 

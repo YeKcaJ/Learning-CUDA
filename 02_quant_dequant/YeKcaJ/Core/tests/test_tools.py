@@ -3,6 +3,7 @@ import importlib.util
 import datetime
 import contextlib
 import io
+import itertools
 import json
 from pathlib import Path
 import subprocess
@@ -22,6 +23,95 @@ def load_tool(name):
 
 
 class ToolTests(unittest.TestCase):
+    def test_run_cli_configuration_and_overrides(self):
+        tool = load_tool("quantize")
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "config.toml"
+            config.write_text('format = "mxfp8"\nblock_size = 32\noutput_type = "fp16"\n')
+            cases = [
+                (["--format", "nvfp4", "--output-type", "bf16", "--output-dir", folder,
+                  "--save", "weights", "log"], "nvfp4", 16, "bf16"),
+                (["--config", str(config)], "mxfp8", 32, "fp16"),
+                (["--config", str(config), "--format", "nvfp4", "--output-type", "fp32",
+                  "--scale-mode", "tensor", "--rounding", "stochastic", "--seed", "42"],
+                 "nvfp4", 16, "fp32"),
+            ]
+            for arguments, fmt, block, dtype in cases:
+                with patch.object(sys, "argv", ["quantize", "run", "--input", "example.fp32"] + arguments), \
+                     patch.object(tool, "run") as run:
+                    tool.main()
+                    cfg = run.call_args.args[0]
+                    self.assertEqual((cfg["format"], cfg["block_size"], cfg["output_type"]), (fmt, block, dtype))
+                    if "--save" in arguments:
+                        self.assertEqual(run.call_args.kwargs["save"], ["weights", "log"])
+                        self.assertEqual(run.call_args.kwargs["output_dir"], Path(folder))
+                    if "--seed" in arguments:
+                        self.assertEqual((cfg["scale_mode"], cfg["rounding"], cfg["seed"]), ("tensor", "stochastic", 42))
+            with patch.object(sys, "argv", ["quantize", "run", "--input", "example.fp32"]), \
+                 self.assertRaisesRegex(ValueError, "--format"):
+                tool.main()
+            with patch.object(sys, "argv", ["quantize", "run", "--input", "example.fp32",
+                                          "--format", "mxfp8", "--prefix", "x", "--output-dir", folder]), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                tool.main()
+
+    def test_selected_artifacts_and_repeat_numbering(self):
+        tool = load_tool("quantize")
+        command_paths = []
+
+        def fake_pipeline(command, **kwargs):
+            packed, tensor = map(Path, command[2:4])
+            packed.parent.mkdir(parents=True, exist_ok=True)
+            tensor.parent.mkdir(parents=True, exist_ok=True)
+            packed.write_bytes(b"weights")
+            tensor.write_bytes(b"tensor")
+            command_paths.append((packed, tensor))
+            return subprocess.CompletedProcess(command, 0, json.dumps(dict(cpu_quant_match=True, cpu_dequant_match=True)), "")
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(tool, "executable", return_value=Path("pipeline")), \
+             patch.object(tool.subprocess, "run", side_effect=fake_pipeline):
+            source = Path(folder) / "input with spaces.bin"
+            tool.generate(source, 1, 33, "fp16", "normal", 1234)
+            original = source.read_bytes()
+            cfg = tool.validate_config(dict(format="nvfp4", output_type="bf16"))
+            choices = [list(c) for n in (1, 2, 3) for c in itertools.combinations(("weights", "tensor", "log"), n)]
+            for i, selection in enumerate(choices + [["all"]]):
+                destination = Path(folder) / str(i)
+                expected = set(("weights", "tensor", "log") if selection == ["all"] else selection)
+                first = tool.run(cfg, source, output_dir=destination, save=selection, quiet=True)
+                self.assertEqual(len(list(destination.iterdir())), len(expected))
+                for key, choice in (("packed", "weights"), ("output", "tensor"), ("log", "log")):
+                    if choice in expected:
+                        self.assertTrue(Path(first[key]).is_file())
+                    else:
+                        self.assertIsNone(first[key])
+                if first["log"]:
+                    self.assertEqual(json.loads(Path(first["log"]).read_text()), first)
+                # 未选文件只留在临时目录，完成后不能出现失效的临时路径日志。
+                for path in command_paths[-1]:
+                    if path.parent != destination:
+                        self.assertFalse(path.exists())
+                snapshot = {p: p.read_bytes() for p in destination.iterdir()}
+                second = tool.run(cfg, source, output_dir=destination, save=selection, quiet=True)
+                self.assertEqual(len(list(destination.iterdir())), len(expected) * 2)
+                for path, data in snapshot.items():
+                    self.assertEqual(path.read_bytes(), data)
+                for key in ("packed", "output", "log"):
+                    if second[key]:
+                        self.assertTrue(Path(second[key]).stem.endswith("_2"))
+                musa = tool.directory_prefix(source, cfg, "musa", destination)
+                self.assertIn("_musa_fp16_bf16", musa.name)
+            self.assertEqual(source.read_bytes(), original)
+            for selection in ([], ["all", "log"], ["unknown"]):
+                with self.assertRaises(ValueError):
+                    tool.run(cfg, source, output_dir=Path(folder) / "invalid", save=selection, quiet=True)
+            prefix = Path(folder) / "existing"
+            packed = prefix.with_suffix(".lpq")
+            packed.write_bytes(b"original")
+            with self.assertRaisesRegex(ValueError, "output exists"):
+                tool.run(cfg, source, prefix=prefix, quiet=True)
+            self.assertEqual(packed.read_bytes(), b"original")
+
     def test_evaluation_inputs_reuse_and_reject_changes(self):
         tool = load_tool("quantize")
         with tempfile.TemporaryDirectory() as folder:

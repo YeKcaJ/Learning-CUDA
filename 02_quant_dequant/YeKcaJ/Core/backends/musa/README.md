@@ -75,6 +75,16 @@ input/<月日>/<编号>.fp32.json
 
 ### ③ 量化并反量化
 
+也可以直接指定参数，无需配置文件：
+
+```bash
+python3 Core/tools/quantize.py run --backend musa \
+  --input input/917/1.fp32 --format nvfp4 --output-type bf16 \
+  --output-dir output/917 --save all
+```
+
+示例输入替换成实际路径。三类文件直接保存到 `output/917/`，前缀为 `1_nvfp4_musa_fp32_bf16`。`--save` 默认 `all`，可多选 `weights tensor log`；未选文件不留存，计算与 CPU 校验仍执行。未指定输出目录时沿用下方布局。配置文件入口继续支持，命令行显式参数优先：
+
 ```bash
 python3 Core/tools/quantize.py run --backend musa \
   --config Core/configs/musa_mxfp8.toml --input input/916/1.fp32
